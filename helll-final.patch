@@ -1,0 +1,5058 @@
+diff --git a/server/bin/build-run.sh b/server/bin/build-run.sh
+index f812cba36..c4fdcd81a 100755
+--- a/server/bin/build-run.sh
++++ b/server/bin/build-run.sh
+@@ -521,7 +521,7 @@ fi
+ if [[ -n "${GST_DEBUG:-}" ]]; then
+     RUN_VARS+=("GST_DEBUG='$GST_DEBUG'")
+ else
+-    RUN_VARS+=("GST_DEBUG='2,Kurento*:4,kms*:4,sdp*:4,webrtc*:4,*rtpendpoint:4,rtp*handler:4,rtpsynchronizer:4,agnosticbin:4'")
++    RUN_VARS+=("GST_DEBUG='1,Kurento*:4,kms*:4,sdp*:4,webrtc*:4,*rtpendpoint:4,rtp*handler:4,rtpsynchronizer:4,agnosticbin:4'")
+ fi
+ 
+ # Pass other relevant environment variables, if set.
+diff --git a/server/module-core/src/gst-plugins/commons/kms-core-marshal.list b/server/module-core/src/gst-plugins/commons/kms-core-marshal.list
+index ae6924095..9b05b12a7 100644
+--- a/server/module-core/src/gst-plugins/commons/kms-core-marshal.list
++++ b/server/module-core/src/gst-plugins/commons/kms-core-marshal.list
+@@ -20,3 +20,4 @@ BOOLEAN:STRING
+ BOOLEAN:VOID
+ STRING:ENUM,STRING,UINT
+ STRING:VOID
++VOID:INT,BOOLEAN,INT,INT,STRING
+\ No newline at end of file
+diff --git a/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.c b/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.c
+index 8a753f4d5..057f08e3e 100644
+--- a/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.c
++++ b/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.c
+@@ -15,7 +15,7 @@
+  *
+  */
+ #ifdef HAVE_CONFIG_H
+-#  include <config.h>
++#include <config.h>
+ #endif
+ 
+ #include <string.h>
+@@ -54,77 +54,69 @@ GST_DEBUG_CATEGORY_STATIC (kms_base_rtp_endpoint_debug);
+ 
+ static const gchar *stats_files_dir = NULL;
+ 
+-static void
+-kms_i_rtp_session_manager_interface_init (KmsIRtpSessionManagerInterface *
+-    iface);
++static void kms_i_rtp_session_manager_interface_init (
++    KmsIRtpSessionManagerInterface *iface);
+ 
+-G_DEFINE_TYPE_WITH_CODE (KmsBaseRtpEndpoint, kms_base_rtp_endpoint,
++G_DEFINE_TYPE_WITH_CODE (KmsBaseRtpEndpoint,
++    kms_base_rtp_endpoint,
+     KMS_TYPE_BASE_SDP_ENDPOINT,
+     G_IMPLEMENT_INTERFACE (KMS_TYPE_I_RTP_SESSION_MANAGER,
+         kms_i_rtp_session_manager_interface_init)
+-    GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, PLUGIN_NAME, 0, PLUGIN_NAME));
++        GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, PLUGIN_NAME, 0, PLUGIN_NAME));
+ 
+-#define KMS_BASE_RTP_ENDPOINT_GET_PRIVATE(obj) (  \
+-  G_TYPE_INSTANCE_GET_PRIVATE (                   \
+-    (obj),                                        \
+-    KMS_TYPE_BASE_RTP_ENDPOINT,                   \
+-    KmsBaseRtpEndpointPrivate                     \
+-  )                                               \
+-)
++#define KMS_BASE_RTP_ENDPOINT_GET_PRIVATE(obj) \
++  (G_TYPE_INSTANCE_GET_PRIVATE ((obj), KMS_TYPE_BASE_RTP_ENDPOINT, \
++      KmsBaseRtpEndpointPrivate))
+ 
+ #define JB_INITIAL_LATENCY 0
+ #define JB_READY_AUDIO_LATENCY 100
+ #define JB_READY_VIDEO_LATENCY 500
+-#define RTCP_FB_CCM_FIR   SDP_MEDIA_RTCP_FB_CCM " " SDP_MEDIA_RTCP_FB_FIR
+-#define RTCP_FB_NACK_PLI  SDP_MEDIA_RTCP_FB_NACK " " SDP_MEDIA_RTCP_FB_PLI
++#define RTCP_FB_CCM_FIR SDP_MEDIA_RTCP_FB_CCM " " SDP_MEDIA_RTCP_FB_FIR
++#define RTCP_FB_NACK_PLI SDP_MEDIA_RTCP_FB_NACK " " SDP_MEDIA_RTCP_FB_PLI
+ 
+ #define DEFAULT_MIN_PORT 1024
+ #define DEFAULT_MAX_PORT 65535
+ 
+ #define PICTURE_ID_15_BIT 2
+ 
+-#define index_of(str,chr) ({  \
+-  gintptr __pos;              \
+-  gchar *__c;                 \
+-  __c = strchr (str, chr);    \
+-  __pos = __c - (str);        \
+-  __pos;                      \
+-})
++#define index_of(str, chr) \
++  ({ \
++    gintptr __pos; \
++    gchar *__c; \
++    __c = strchr (str, chr); \
++    __pos = __c - (str); \
++    __pos; \
++  })
+ 
+ typedef struct _KmsSSRCStats KmsSSRCStats;
+-struct _KmsSSRCStats
+-{
++struct _KmsSSRCStats {
+   guint ssrc;
+   GstElement *jitter_buffer;
+ };
+ 
+ typedef struct _KmsRTPSessionStats KmsRTPSessionStats;
+-struct _KmsRTPSessionStats
+-{
++struct _KmsRTPSessionStats {
+   GObject *rtp_session;
+   GstSDPDirection direction;
+-  GSList *ssrcs;                /* list of all jitter buffers associated to a ssrc */
++  GSList *ssrcs; /* list of all jitter buffers associated to a ssrc */
+ };
+ 
+ typedef struct _KmsBaseRTPStats KmsBaseRTPStats;
+-struct _KmsBaseRTPStats
+-{
++struct _KmsBaseRTPStats {
+   gboolean enabled;
+   GHashTable *rtp_stats;
+   GSList *probes;
+   /* End-to-end average stream stats */
+-  GHashTable *avg_e2e;          /* <"pad_name", StreamE2EAvgStat> */
++  GHashTable *avg_e2e; /* <"pad_name", StreamE2EAvgStat> */
+ };
+ 
+-typedef struct _ExtData
+-{
++typedef struct _ExtData {
+   KmsRefStruct ref;
+   gint ulpfec_pt;
+   gint red_pt;
+ } ExtData;
+ 
+-typedef struct _E2EProbeData
+-{
++typedef struct _E2EProbeData {
+   gchar *id;
+   StreamE2EAvgStat *stat;
+ } E2EProbeData;
+@@ -140,7 +132,7 @@ e2e_probe_data_new ()
+ }
+ 
+ static void
+-e2e_probe_data_destroy (E2EProbeData * data)
++e2e_probe_data_destroy (E2EProbeData *data)
+ {
+   g_free (data->id);
+   kms_stats_stream_e2e_avg_stat_unref (data->stat);
+@@ -150,8 +142,7 @@ e2e_probe_data_destroy (E2EProbeData * data)
+ 
+ /* RtpMediaConfig begin */
+ 
+-typedef struct _RtpMediaConfig
+-{
++typedef struct _RtpMediaConfig {
+   KmsRefStruct ref;
+ 
+   guint local_ssrc;
+@@ -160,13 +151,13 @@ typedef struct _RtpMediaConfig
+ } RtpMediaConfig;
+ 
+ static void
+-rtp_media_config_destroy (RtpMediaConfig * config)
++rtp_media_config_destroy (RtpMediaConfig *config)
+ {
+   g_slice_free (RtpMediaConfig, config);
+ }
+ 
+ void
+-rtp_media_config_unref (RtpMediaConfig * config)
++rtp_media_config_unref (RtpMediaConfig *config)
+ {
+   kms_ref_struct_unref (KMS_REF_STRUCT_CAST (config));
+ }
+@@ -179,7 +170,7 @@ rtp_media_config_new ()
+   config = g_slice_new0 (RtpMediaConfig);
+ 
+   kms_ref_struct_init (KMS_REF_STRUCT_CAST (config),
+-      (GDestroyNotify) rtp_media_config_destroy);
++      (GDestroyNotify)rtp_media_config_destroy);
+ 
+   return config;
+ }
+@@ -187,7 +178,7 @@ rtp_media_config_new ()
+ /* RtpMediaConfig end */
+ 
+ static void
+-ext_data_destroy (ExtData * edata)
++ext_data_destroy (ExtData *edata)
+ {
+   g_slice_free (ExtData, edata);
+ }
+@@ -199,13 +190,12 @@ ext_data_new ()
+ 
+   edata = g_slice_new0 (ExtData);
+   kms_ref_struct_init (KMS_REF_STRUCT_CAST (edata),
+-      (GDestroyNotify) ext_data_destroy);
++      (GDestroyNotify)ext_data_destroy);
+ 
+   return edata;
+ }
+ 
+-struct _KmsBaseRtpEndpointPrivate
+-{
++struct _KmsBaseRtpEndpointPrivate {
+   KmsBaseRtpSession *sess;
+ 
+   GstElement *rtpbin;
+@@ -248,30 +238,29 @@ struct _KmsBaseRtpEndpointPrivate
+ };
+ 
+ /* Signals and args */
+-enum
+-{
++enum {
+   MEDIA_START,
+   MEDIA_STOP,
+   MEDIA_STATE_CHANGED,
+   GET_CONNECTION_STATE,
+   CONNECTION_STATE_CHANGED,
+   SIGNAL_REQUEST_LOCAL_KEY_FRAME,
++  DTMF_EVENT_DETECTED,
+   LAST_SIGNAL
+ };
+ 
+-static guint obj_signals[LAST_SIGNAL] = { 0 };
++static guint obj_signals[LAST_SIGNAL] = {0};
+ 
+-#define DEFAULT_OFFER_DIR   GST_SDP_DIRECTION_SENDRECV
+-#define DEFAULT_RTCP_MUX    FALSE
+-#define DEFAULT_RTCP_NACK    FALSE
+-#define DEFAULT_RTCP_REMB    FALSE
++#define DEFAULT_OFFER_DIR GST_SDP_DIRECTION_SENDRECV
++#define DEFAULT_RTCP_MUX FALSE
++#define DEFAULT_RTCP_NACK FALSE
++#define DEFAULT_RTCP_REMB FALSE
+ #define MIN_VIDEO_RECV_BW_DEFAULT 0
+-#define MIN_VIDEO_SEND_BW_DEFAULT 100  // kbps
+-#define MAX_VIDEO_SEND_BW_DEFAULT 500  // kbps
++#define MIN_VIDEO_SEND_BW_DEFAULT 100 // kbps
++#define MAX_VIDEO_SEND_BW_DEFAULT 500 // kbps
+ #define DEFAULT_MTU 1200 // Bytes
+ 
+-enum
+-{
++enum {
+   PROP_0,
+   PROP_RTCP_MUX,
+   PROP_RTCP_NACK,
+@@ -290,7 +279,7 @@ enum
+ };
+ 
+ static gboolean
+-is_proto (const gchar * term, const gchar * opt, const gchar * proto)
++is_proto (const gchar *term, const gchar *opt, const gchar *proto)
+ {
+   gchar *pattern;
+   GRegex *regex;
+@@ -307,8 +296,7 @@ is_proto (const gchar * term, const gchar * opt, const gchar * proto)
+ 
+ /* RTP hdrext begin */
+ 
+-typedef struct _HdrExtData
+-{
++typedef struct _HdrExtData {
+   GstPad *pad;
+   /* Useful to make buffers writable when needed. */
+   gboolean add_hdr;
+@@ -317,7 +305,9 @@ typedef struct _HdrExtData
+ } HdrExtData;
+ 
+ static HdrExtData *
+-hdr_ext_data_new (GstPad * pad, gboolean add_hdr, gboolean set_time,
++hdr_ext_data_new (GstPad *pad,
++    gboolean add_hdr,
++    gboolean set_time,
+     gint abs_send_time_id)
+ {
+   HdrExtData *data;
+@@ -332,7 +322,7 @@ hdr_ext_data_new (GstPad * pad, gboolean add_hdr, gboolean set_time,
+ }
+ 
+ static void
+-hdr_ext_data_destroy (HdrExtData * data)
++hdr_ext_data_destroy (HdrExtData *data)
+ {
+   g_slice_free (HdrExtData, data);
+ }
+@@ -340,11 +330,11 @@ hdr_ext_data_destroy (HdrExtData * data)
+ static void
+ hdr_ext_data_destroy_pointer (gpointer data)
+ {
+-  hdr_ext_data_destroy ((HdrExtData *) data);
++  hdr_ext_data_destroy ((HdrExtData *)data);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtp_hdr_ext_set_time (guint8 * data)
++kms_base_rtp_endpoint_rtp_hdr_ext_set_time (guint8 *data)
+ {
+   GstClockTime current_time, ms;
+   guint value;
+@@ -353,15 +343,17 @@ kms_base_rtp_endpoint_rtp_hdr_ext_set_time (guint8 * data)
+   ms = GST_TIME_AS_MSECONDS (current_time);
+   value = (((ms << 18) / 1000) & 0x00ffffff);
+ 
+-  data[0] = (guint8) (value >> 16);
+-  data[1] = (guint8) (value >> 8);
+-  data[2] = (guint8) (value);
++  data[0] = (guint8)(value >> 16);
++  data[1] = (guint8)(value >> 8);
++  data[2] = (guint8)(value);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_add_rtp_hdr_ext (HdrExtData * data, GstBuffer * buffer)
++kms_base_rtp_endpoint_add_rtp_hdr_ext (HdrExtData *data, GstBuffer *buffer)
+ {
+-  GstRTPBuffer rtp = { NULL, };
++  GstRTPBuffer rtp = {
++      NULL,
++  };
+   guint8 id = data->abs_send_time_id;
+   GstMapFlags map_flags;
+   guint8 *time;
+@@ -378,8 +370,8 @@ kms_base_rtp_endpoint_add_rtp_hdr_ext (HdrExtData * data, GstBuffer * buffer)
+     return;
+   }
+ 
+-  if (!gst_rtp_buffer_get_extension_onebyte_header (&rtp,
+-          id, 0, (gpointer) & time, &size)) {
++  if (!gst_rtp_buffer_get_extension_onebyte_header (&rtp, id, 0,
++          (gpointer)&time, &size)) {
+     GST_TRACE_OBJECT (data->pad,
+         "RTP hdrext abs-send-time with id '%d' not found", id);
+ 
+@@ -395,8 +387,8 @@ kms_base_rtp_endpoint_add_rtp_hdr_ext (HdrExtData * data, GstBuffer * buffer)
+       kms_base_rtp_endpoint_rtp_hdr_ext_set_time (time);
+     }
+ 
+-    if (!gst_rtp_buffer_add_extension_onebyte_header (&rtp,
+-            id, time, RTP_HDR_EXT_ABS_SEND_TIME_SIZE)) {
++    if (!gst_rtp_buffer_add_extension_onebyte_header (&rtp, id, time,
++            RTP_HDR_EXT_ABS_SEND_TIME_SIZE)) {
+       GST_WARNING_OBJECT (data->pad, "RTP hdrext abs-send-time not added");
+     }
+ 
+@@ -417,8 +409,9 @@ end:
+ }
+ 
+ static gboolean
+-kms_base_rtp_endpoint_add_rtp_hdr_ext_bufflist (GstBuffer ** buf, guint idx,
+-    HdrExtData * data)
++kms_base_rtp_endpoint_add_rtp_hdr_ext_bufflist (GstBuffer **buf,
++    guint idx,
++    HdrExtData *data)
+ {
+   if (data->add_hdr) {
+     *buf = gst_buffer_make_writable (*buf);
+@@ -429,10 +422,11 @@ kms_base_rtp_endpoint_add_rtp_hdr_ext_bufflist (GstBuffer ** buf, guint idx,
+ }
+ 
+ static GstPadProbeReturn
+-kms_base_rtp_endpoint_add_rtp_hdr_ext_probe (GstPad * pad,
+-    GstPadProbeInfo * info, gpointer gp)
++kms_base_rtp_endpoint_add_rtp_hdr_ext_probe (GstPad *pad,
++    GstPadProbeInfo *info,
++    gpointer gp)
+ {
+-  HdrExtData *data = (HdrExtData *) gp;
++  HdrExtData *data = (HdrExtData *)gp;
+ 
+   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+     GstBuffer *buffer = gst_pad_probe_info_get_buffer (info);
+@@ -449,7 +443,7 @@ kms_base_rtp_endpoint_add_rtp_hdr_ext_probe (GstPad * pad,
+       bufflist = gst_buffer_list_make_writable (bufflist);
+     }
+     gst_buffer_list_foreach (bufflist,
+-        (GstBufferListFunc) kms_base_rtp_endpoint_add_rtp_hdr_ext_bufflist,
++        (GstBufferListFunc)kms_base_rtp_endpoint_add_rtp_hdr_ext_bufflist,
+         data);
+ 
+     GST_PAD_PROBE_INFO_DATA (info) = bufflist;
+@@ -459,8 +453,9 @@ kms_base_rtp_endpoint_add_rtp_hdr_ext_probe (GstPad * pad,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_config_rtp_hdr_ext (KmsBaseRtpEndpoint * self,
+-    const GstSDPMedia * media, GstElement * payloader)
++kms_base_rtp_endpoint_config_rtp_hdr_ext (KmsBaseRtpEndpoint *self,
++    const GstSDPMedia *media,
++    GstElement *payloader)
+ {
+   HdrExtData *data;
+   gint abs_send_time_id;
+@@ -481,8 +476,8 @@ kms_base_rtp_endpoint_config_rtp_hdr_ext (KmsBaseRtpEndpoint * self,
+   data = hdr_ext_data_new (pad, TRUE, FALSE, abs_send_time_id);
+ 
+   GST_DEBUG_OBJECT (self,
+-      "Add probe for adding abs-send-time (id: %d, %" GST_PTR_FORMAT
+-      ").", abs_send_time_id, pad);
++      "Add probe for adding abs-send-time (id: %d, %" GST_PTR_FORMAT ").",
++      abs_send_time_id, pad);
+   gst_pad_add_probe (pad,
+       GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+       kms_base_rtp_endpoint_add_rtp_hdr_ext_probe, data,
+@@ -495,8 +490,8 @@ kms_base_rtp_endpoint_config_rtp_hdr_ext (KmsBaseRtpEndpoint * self,
+ /* Media handler management begin */
+ 
+ static GstSDPDirection
+-on_offer_media_direction (KmsSdpMediaDirectionExt * ext,
+-    KmsBaseRtpEndpoint * self)
++on_offer_media_direction (KmsSdpMediaDirectionExt *ext,
++    KmsBaseRtpEndpoint *self)
+ {
+   GstSDPDirection offer_dir;
+ 
+@@ -506,26 +501,29 @@ on_offer_media_direction (KmsSdpMediaDirectionExt * ext,
+ }
+ 
+ static GstSDPDirection
+-on_answer_media_direction (KmsSdpMediaDirectionExt * ext,
+-    GstSDPDirection dir, KmsBaseRtpEndpoint * self)
++on_answer_media_direction (KmsSdpMediaDirectionExt *ext,
++    GstSDPDirection dir,
++    KmsBaseRtpEndpoint *self)
+ {
+   // RFC3264 6.1
+   switch (dir) {
+-    case GST_SDP_DIRECTION_SENDONLY:
+-      return GST_SDP_DIRECTION_RECVONLY;
+-    case GST_SDP_DIRECTION_RECVONLY:
+-      return GST_SDP_DIRECTION_SENDONLY;
+-    case GST_SDP_DIRECTION_SENDRECV:
+-      return GST_SDP_DIRECTION_SENDRECV;
+-    case GST_SDP_DIRECTION_INACTIVE:
+-      return GST_SDP_DIRECTION_INACTIVE;
+-    default:
+-      return GST_SDP_DIRECTION_SENDRECV;
++  case GST_SDP_DIRECTION_SENDONLY:
++    return GST_SDP_DIRECTION_RECVONLY;
++  case GST_SDP_DIRECTION_RECVONLY:
++    return GST_SDP_DIRECTION_SENDONLY;
++  case GST_SDP_DIRECTION_SENDRECV:
++    return GST_SDP_DIRECTION_SENDRECV;
++  case GST_SDP_DIRECTION_INACTIVE:
++    return GST_SDP_DIRECTION_INACTIVE;
++  default:
++    return GST_SDP_DIRECTION_SENDRECV;
+   }
+ }
+ 
+ static gboolean
+-on_offered_ulp_fec_cb (KmsSdpUlpFecExt * ext, guint pt, guint clock_rate,
++on_offered_ulp_fec_cb (KmsSdpUlpFecExt *ext,
++    guint pt,
++    guint clock_rate,
+     gpointer user_data)
+ {
+   ExtData *edata = user_data;
+@@ -536,7 +534,9 @@ on_offered_ulp_fec_cb (KmsSdpUlpFecExt * ext, guint pt, guint clock_rate,
+ }
+ 
+ static gboolean
+-on_offered_redundancy_cb (KmsSdpUlpFecExt * ext, guint pt, guint clock_rate,
++on_offered_redundancy_cb (KmsSdpUlpFecExt *ext,
++    guint pt,
++    guint clock_rate,
+     gpointer user_data)
+ {
+   ExtData *edata = user_data;
+@@ -547,8 +547,9 @@ on_offered_redundancy_cb (KmsSdpUlpFecExt * ext, guint pt, guint clock_rate,
+ }
+ 
+ static void
+-kms_base_rtp_configure_extensions (KmsBaseRtpEndpoint * self,
+-    const gchar * media, KmsSdpMediaHandler * handler)
++kms_base_rtp_configure_extensions (KmsBaseRtpEndpoint *self,
++    const gchar *media,
++    KmsSdpMediaHandler *handler)
+ {
+   KmsSdpMediaDirectionExt *mediadirext;
+   KmsSdpUlpFecExt *ulpfecext;
+@@ -578,11 +579,11 @@ kms_base_rtp_configure_extensions (KmsBaseRtpEndpoint * self,
+   g_signal_connect_data (redext, "on-offered-redundancy",
+       G_CALLBACK (on_offered_redundancy_cb),
+       kms_ref_struct_ref (KMS_REF_STRUCT_CAST (edata)),
+-      (GClosureNotify) kms_ref_struct_unref, 0);
++      (GClosureNotify)kms_ref_struct_unref, 0);
+   g_signal_connect_data (ulpfecext, "on-offered-ulp-fec",
+       G_CALLBACK (on_offered_ulp_fec_cb),
+       kms_ref_struct_ref (KMS_REF_STRUCT_CAST (edata)),
+-      (GClosureNotify) kms_ref_struct_unref, 0);
++      (GClosureNotify)kms_ref_struct_unref, 0);
+ 
+   kms_sdp_media_handler_add_media_extension (handler,
+       KMS_I_SDP_MEDIA_EXTENSION (ulpfecext));
+@@ -591,8 +592,9 @@ kms_base_rtp_configure_extensions (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static void
+-kms_base_rtp_create_media_handler (KmsBaseSdpEndpoint * base_sdp,
+-    const gchar * media, KmsSdpMediaHandler ** handler)
++kms_base_rtp_create_media_handler (KmsBaseSdpEndpoint *base_sdp,
++    const gchar *media,
++    KmsSdpMediaHandler **handler)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (base_sdp);
+ 
+@@ -612,8 +614,7 @@ kms_base_rtp_create_media_handler (KmsBaseSdpEndpoint * base_sdp,
+   g_object_set (G_OBJECT (*handler), "rtcp-mux", self->priv->rtcp_mux, NULL);
+ 
+   if (KMS_IS_SDP_RTP_AVPF_MEDIA_HANDLER (*handler)) {
+-    g_object_set (G_OBJECT (*handler),
+-        "nack", self->priv->rtcp_nack,
++    g_object_set (G_OBJECT (*handler), "nack", self->priv->rtcp_nack,
+         "goog-remb", self->priv->rtcp_remb, NULL);
+   }
+   h_avp = KMS_SDP_RTP_AVP_MEDIA_HANDLER (*handler);
+@@ -631,8 +632,7 @@ kms_base_rtp_create_media_handler (KmsBaseSdpEndpoint * base_sdp,
+ 
+ /* Media handler management end */
+ 
+-typedef struct _ConnectPayloaderData
+-{
++typedef struct _ConnectPayloaderData {
+   KmsRefStruct ref;
+   KmsBaseRtpEndpoint *self;
+   GstElement *payloader;
+@@ -647,7 +647,8 @@ connect_payloader_data_destroy (gpointer data)
+ }
+ 
+ static ConnectPayloaderData *
+-connect_payloader_data_new (KmsBaseRtpEndpoint * self, GstElement * payloader,
++connect_payloader_data_new (KmsBaseRtpEndpoint *self,
++    GstElement *payloader,
+     KmsElementPadType type)
+ {
+   ConnectPayloaderData *data;
+@@ -655,7 +656,7 @@ connect_payloader_data_new (KmsBaseRtpEndpoint * self, GstElement * payloader,
+   data = g_slice_new0 (ConnectPayloaderData);
+ 
+   kms_ref_struct_init (KMS_REF_STRUCT_CAST (data),
+-      (GDestroyNotify) connect_payloader_data_destroy);
++      (GDestroyNotify)connect_payloader_data_destroy);
+ 
+   data->self = self;
+   data->payloader = payloader;
+@@ -665,7 +666,7 @@ connect_payloader_data_new (KmsBaseRtpEndpoint * self, GstElement * payloader,
+ }
+ 
+ static KmsSSRCStats *
+-ssrc_stats_new (guint ssrc, GstElement * jitter_buffer)
++ssrc_stats_new (guint ssrc, GstElement *jitter_buffer)
+ {
+   KmsSSRCStats *stats;
+ 
+@@ -678,14 +679,14 @@ ssrc_stats_new (guint ssrc, GstElement * jitter_buffer)
+ }
+ 
+ static void
+-ssrc_stats_destroy (KmsSSRCStats * stats)
++ssrc_stats_destroy (KmsSSRCStats *stats)
+ {
+   g_clear_object (&stats->jitter_buffer);
+   g_slice_free (KmsSSRCStats, stats);
+ }
+ 
+ static KmsRTPSessionStats *
+-rtp_session_stats_new (GObject * rtp_session, GstSDPDirection direction)
++rtp_session_stats_new (GObject *rtp_session, GstSDPDirection direction)
+ {
+   KmsRTPSessionStats *stats;
+ 
+@@ -697,10 +698,10 @@ rtp_session_stats_new (GObject * rtp_session, GstSDPDirection direction)
+ }
+ 
+ static void
+-rtp_session_stats_destroy (KmsRTPSessionStats * stats)
++rtp_session_stats_destroy (KmsRTPSessionStats *stats)
+ {
+   if (stats->ssrcs != NULL) {
+-    g_slist_free_full (stats->ssrcs, (GDestroyNotify) ssrc_stats_destroy);
++    g_slist_free_full (stats->ssrcs, (GDestroyNotify)ssrc_stats_destroy);
+   }
+ 
+   g_clear_object (&stats->rtp_session);
+@@ -709,7 +710,7 @@ rtp_session_stats_destroy (KmsRTPSessionStats * stats)
+ }
+ 
+ static gboolean
+-kms_base_rtp_endpoint_is_video_rtcp_nack (KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_is_video_rtcp_nack (KmsBaseRtpEndpoint *self)
+ {
+   KmsBaseSdpEndpoint *base_endpoint = KMS_BASE_SDP_ENDPOINT (self);
+   const GstSDPMessage *sdp =
+@@ -737,8 +738,10 @@ kms_base_rtp_endpoint_is_video_rtcp_nack (KmsBaseRtpEndpoint * self)
+ 
+ /* Configure media SDP begin */
+ static GObject *
+-kms_base_rtp_endpoint_create_rtp_session (KmsBaseRtpEndpoint * self,
+-    guint session_id, const gchar * rtpbin_pad_name, GstRTPProfile rtp_profile,
++kms_base_rtp_endpoint_create_rtp_session (KmsBaseRtpEndpoint *self,
++    guint session_id,
++    const gchar *rtpbin_pad_name,
++    GstRTPProfile rtp_profile,
+     GstSDPDirection direction)
+ {
+   GstElement *rtpbin = self->priv->rtpbin;
+@@ -758,8 +761,7 @@ kms_base_rtp_endpoint_create_rtp_session (KmsBaseRtpEndpoint * self,
+ 
+   KMS_ELEMENT_LOCK (self);
+ 
+-  rtp_stats =
+-      g_hash_table_lookup (self->priv->stats.rtp_stats,
++  rtp_stats = g_hash_table_lookup (self->priv->stats.rtp_stats,
+       GUINT_TO_POINTER (session_id));
+ 
+   if (rtp_stats == NULL) {
+@@ -778,8 +780,8 @@ kms_base_rtp_endpoint_create_rtp_session (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static GstRTPProfile
+-kms_base_rtp_endpoint_media_proto_to_rtp_profile (KmsBaseRtpEndpoint * self,
+-    const gchar * proto)
++kms_base_rtp_endpoint_media_proto_to_rtp_profile (KmsBaseRtpEndpoint *self,
++    const gchar *proto)
+ {
+   if (g_strcmp0 (proto, "RTP/AVP") == 0) {
+     return GST_RTP_PROFILE_AVP;
+@@ -796,8 +798,9 @@ kms_base_rtp_endpoint_media_proto_to_rtp_profile (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static gboolean
+-kms_base_rtp_endpoint_configure_rtp_media (KmsBaseRtpEndpoint * self,
+-    KmsBaseRtpSession * base_rtp_sess, GstSDPMedia * media)
++kms_base_rtp_endpoint_configure_rtp_media (KmsBaseRtpEndpoint *self,
++    KmsBaseRtpSession *base_rtp_sess,
++    GstSDPMedia *media)
+ {
+   const gchar *proto_str = gst_sdp_media_get_proto (media);
+   const gchar *media_str = gst_sdp_media_get_media (media);
+@@ -829,8 +832,7 @@ kms_base_rtp_endpoint_configure_rtp_media (KmsBaseRtpEndpoint * self,
+ 
+   dir = sdp_utils_media_config_get_direction (media);
+ 
+-  rtpsession =
+-      kms_base_rtp_endpoint_create_rtp_session (self, session_id,
++  rtpsession = kms_base_rtp_endpoint_create_rtp_session (self, session_id,
+       rtpbin_pad_name,
+       kms_base_rtp_endpoint_media_proto_to_rtp_profile (self, proto_str), dir);
+   if (rtpsession == NULL) {
+@@ -863,9 +865,10 @@ kms_base_rtp_endpoint_configure_rtp_media (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static gboolean
+-kms_base_rtp_endpoint_configure_media (KmsBaseSdpEndpoint *
+-    base_sdp_endpoint, KmsSdpSession * sess, KmsSdpMediaHandler * handler,
+-    GstSDPMedia * media)
++kms_base_rtp_endpoint_configure_media (KmsBaseSdpEndpoint *base_sdp_endpoint,
++    KmsSdpSession *sess,
++    KmsSdpMediaHandler *handler,
++    GstSDPMedia *media)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (base_sdp_endpoint);
+   KmsBaseRtpSession *base_rtp_sess = KMS_BASE_RTP_SESSION (sess);
+@@ -888,8 +891,9 @@ kms_base_rtp_endpoint_configure_media (KmsBaseSdpEndpoint *
+ /* Start Transport Send begin */
+ 
+ static GstPad *
+-kms_base_rtp_endpoint_request_rtp_sink (KmsIRtpSessionManager * manager,
+-    KmsBaseRtpSession * sess, const GstSDPMedia * media)
++kms_base_rtp_endpoint_request_rtp_sink (KmsIRtpSessionManager *manager,
++    KmsBaseRtpSession *sess,
++    const GstSDPMedia *media)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (manager);
+   const gchar *media_str = media ? gst_sdp_media_get_media (media) : NULL;
+@@ -925,22 +929,21 @@ kms_base_rtp_endpoint_request_rtp_sink (KmsIRtpSessionManager * manager,
+ }
+ 
+ static GstPad *
+-kms_base_rtp_endpoint_request_rtp_src (KmsIRtpSessionManager * manager,
+-    KmsBaseRtpSession * sess, const GstSDPMedia * media)
++kms_base_rtp_endpoint_request_rtp_src (KmsIRtpSessionManager *manager,
++    KmsBaseRtpSession *sess,
++    const GstSDPMedia *media)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (manager);
+   const gchar *media_str = gst_sdp_media_get_media (media);
+   GstPad *pad;
+ 
+   if (g_strcmp0 (AUDIO_STREAM_NAME, media_str) == 0) {
+-    pad =
+-        gst_element_get_static_pad (self->priv->rtpbin,
++    pad = gst_element_get_static_pad (self->priv->rtpbin,
+         AUDIO_RTPBIN_SEND_RTP_SRC);
+   } else if (g_strcmp0 (VIDEO_STREAM_NAME, media_str) == 0) {
+     gint abs_send_time_id;
+ 
+-    pad =
+-        gst_element_get_static_pad (self->priv->rtpbin,
++    pad = gst_element_get_static_pad (self->priv->rtpbin,
+         VIDEO_RTPBIN_SEND_RTP_SRC);
+ 
+     kms_utils_drop_until_keyframe (pad, TRUE);
+@@ -955,8 +958,8 @@ kms_base_rtp_endpoint_request_rtp_src (KmsIRtpSessionManager * manager,
+           abs_send_time_id, pad);
+       gst_pad_add_probe (pad,
+           GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+-          kms_base_rtp_endpoint_add_rtp_hdr_ext_probe,
+-          data, hdr_ext_data_destroy_pointer);
++          kms_base_rtp_endpoint_add_rtp_hdr_ext_probe, data,
++          hdr_ext_data_destroy_pointer);
+     }
+   } else {
+     GST_ERROR_OBJECT (self, "'%s' not valid", media_str);
+@@ -1021,20 +1024,19 @@ kms_base_rtp_endpoint_request_rtcp_sink (KmsIRtpSessionManager *manager,
+ }
+ 
+ static GstPad *
+-kms_base_rtp_endpoint_request_rtcp_src (KmsIRtpSessionManager * manager,
+-    KmsBaseRtpSession * sess, const GstSDPMedia * media)
++kms_base_rtp_endpoint_request_rtcp_src (KmsIRtpSessionManager *manager,
++    KmsBaseRtpSession *sess,
++    const GstSDPMedia *media)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (manager);
+   const gchar *media_str = gst_sdp_media_get_media (media);
+   GstPad *pad;
+ 
+   if (g_strcmp0 (AUDIO_STREAM_NAME, media_str) == 0) {
+-    pad =
+-        gst_element_request_pad_simple (self->priv->rtpbin,
++    pad = gst_element_request_pad_simple (self->priv->rtpbin,
+         AUDIO_RTPBIN_SEND_RTCP_SRC);
+   } else if (g_strcmp0 (VIDEO_STREAM_NAME, media_str) == 0) {
+-    pad =
+-        gst_element_request_pad_simple (self->priv->rtpbin,
++    pad = gst_element_request_pad_simple (self->priv->rtpbin,
+         VIDEO_RTPBIN_SEND_RTCP_SRC);
+   } else {
+     GST_ERROR_OBJECT (self, "'%s' not valid", media_str);
+@@ -1045,8 +1047,8 @@ kms_base_rtp_endpoint_request_rtcp_src (KmsIRtpSessionManager * manager,
+ }
+ 
+ static KmsConnectionState
+-kms_base_rtp_endpoint_get_connection_state (KmsBaseRtpEndpoint * self,
+-    const gchar * sess_id)
++kms_base_rtp_endpoint_get_connection_state (KmsBaseRtpEndpoint *self,
++    const gchar *sess_id)
+ {
+   KmsBaseSdpEndpoint *base_endpoint = KMS_BASE_SDP_ENDPOINT (self);
+   GHashTable *sessions;
+@@ -1086,7 +1088,7 @@ kms_base_rtp_endpoint_create_remb_manager (KmsBaseRtpEndpoint *self,
+     } Dummy; // Same as KmsRlRemoteSession
+     Dummy *rlrs = g_slist_nth_data (self->priv->rl->remote_sessions, 0);
+     GST_WARNING_OBJECT (self, "REMB is already in use for remote video SSRC %u",
+-                        rlrs->ssrc);
++        rlrs->ssrc);
+     return;
+   }
+ 
+@@ -1094,11 +1096,12 @@ kms_base_rtp_endpoint_create_remb_manager (KmsBaseRtpEndpoint *self,
+   guint id = base_sess->id;
+   gchar *id_str = base_sess->id_str;
+   guint32 remote_video_ssrc = sess->remote_video_ssrc;
+-  GST_INFO_OBJECT (self, "Creating REMB for session ID %u (%s) and remote video SSRC %u",
+-                      id, id_str, remote_video_ssrc);
++  GST_INFO_OBJECT (self,
++      "Creating REMB for session ID %u (%s) and remote video SSRC %u", id,
++      id_str, remote_video_ssrc);
+ 
+   GObject *rtpsession = kms_base_rtp_endpoint_get_internal_session (
+-      KMS_BASE_RTP_ENDPOINT(self), VIDEO_RTP_SESSION);
++      KMS_BASE_RTP_ENDPOINT (self), VIDEO_RTP_SESSION);
+   if (rtpsession == NULL) {
+     return;
+   }
+@@ -1112,17 +1115,16 @@ kms_base_rtp_endpoint_create_remb_manager (KmsBaseRtpEndpoint *self,
+ 
+   guint max_recv_bw;
+   g_object_get (self, "max-video-recv-bandwidth", &max_recv_bw, NULL);
+-  self->priv->rl =
+-      kms_remb_local_create (rtpsession, self->priv->min_video_recv_bw,
+-      max_recv_bw);
++  self->priv->rl = kms_remb_local_create (rtpsession,
++      self->priv->min_video_recv_bw, max_recv_bw);
+   kms_remb_local_add_remote_session (self->priv->rl, rtpsession,
+       sess->remote_video_ssrc);
+ 
+-  pad = gst_element_get_static_pad (self->priv->rtpbin, VIDEO_RTPBIN_SEND_RTP_SINK);
++  pad = gst_element_get_static_pad (self->priv->rtpbin,
++      VIDEO_RTPBIN_SEND_RTP_SINK);
+   self->priv->rm =
+-      kms_remb_remote_create (rtpsession,
+-      self->priv->video_config->local_ssrc, self->priv->min_video_send_bw,
+-      self->priv->max_video_send_bw, pad);
++      kms_remb_remote_create (rtpsession, self->priv->video_config->local_ssrc,
++          self->priv->min_video_send_bw, self->priv->max_video_send_bw, pad);
+   g_object_unref (pad);
+   g_object_unref (rtpsession);
+ 
+@@ -1135,8 +1137,10 @@ kms_base_rtp_endpoint_create_remb_manager (KmsBaseRtpEndpoint *self,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_start_transport_send (KmsBaseSdpEndpoint *
+-    base_sdp_endpoint, KmsSdpSession * sess, gboolean offerer)
++kms_base_rtp_endpoint_start_transport_send (
++    KmsBaseSdpEndpoint *base_sdp_endpoint,
++    KmsSdpSession *sess,
++    gboolean offerer)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (base_sdp_endpoint);
+   KmsBaseRtpSession *base_rtp_sess = KMS_BASE_RTP_SESSION (sess);
+@@ -1158,7 +1162,7 @@ kms_base_rtp_endpoint_start_transport_send (KmsBaseSdpEndpoint *
+ /* Start Transport Send end */
+ 
+ static gboolean
+-kms_base_rtp_endpoint_request_local_key_frame (KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_request_local_key_frame (KmsBaseRtpEndpoint *self)
+ {
+   GstPad *pad;
+   GstEvent *event;
+@@ -1166,8 +1170,7 @@ kms_base_rtp_endpoint_request_local_key_frame (KmsBaseRtpEndpoint * self)
+ 
+   GST_DEBUG_OBJECT (self, "Forcing a new keyframe request");
+ 
+-  pad =
+-      gst_element_get_static_pad (self->priv->rtpbin,
++  pad = gst_element_get_static_pad (self->priv->rtpbin,
+       VIDEO_RTPBIN_SEND_RTP_SRC);
+   if (pad == NULL) {
+     GST_WARNING_OBJECT (self,
+@@ -1175,8 +1178,7 @@ kms_base_rtp_endpoint_request_local_key_frame (KmsBaseRtpEndpoint * self)
+     return FALSE;
+   }
+ 
+-  event =
+-      gst_video_event_new_upstream_force_key_unit (GST_CLOCK_TIME_NONE,
++  event = gst_video_event_new_upstream_force_key_unit (GST_CLOCK_TIME_NONE,
+       TRUE, 0);
+   ret = gst_pad_send_event (pad, event);
+   g_object_unref (pad);
+@@ -1192,8 +1194,9 @@ kms_base_rtp_endpoint_request_local_key_frame (KmsBaseRtpEndpoint * self)
+ /* Connect input elements begin */
+ /* Payloading configuration begin */
+ static GstCaps *
+-kms_base_rtp_endpoint_get_caps_from_rtpmap (const gchar * media,
+-    const gchar * pt, const gchar * rtpmap)
++kms_base_rtp_endpoint_get_caps_from_rtpmap (const gchar *media,
++    const gchar *pt,
++    const gchar *rtpmap)
+ {
+   GstCaps *caps = NULL;
+   gint clock_rate;
+@@ -1208,11 +1211,9 @@ kms_base_rtp_endpoint_get_caps_from_rtpmap (const gchar * media,
+     return NULL;
+   }
+ 
+-  caps = gst_caps_new_simple ("application/x-rtp",
+-      "media", G_TYPE_STRING, media,
+-      "payload", G_TYPE_INT, atoi (pt),
+-      "clock-rate", G_TYPE_INT, clock_rate,
+-      "encoding-name", G_TYPE_STRING,
++  caps = gst_caps_new_simple ("application/x-rtp", "media", G_TYPE_STRING,
++      media, "payload", G_TYPE_INT, atoi (pt), "clock-rate", G_TYPE_INT,
++      clock_rate, "encoding-name", G_TYPE_STRING,
+       kms_utils_get_caps_codec_name_from_sdp (codec_name), NULL);
+ 
+   g_free (codec_name);
+@@ -1220,8 +1221,8 @@ kms_base_rtp_endpoint_get_caps_from_rtpmap (const gchar * media,
+   return caps;
+ }
+ 
+-static GstElementFactory*
+-select_payloader (GList *filtered_list) 
++static GstElementFactory *
++select_payloader (GList *filtered_list)
+ {
+   GstElementFactory *payloader_factory = NULL;
+   GList *l;
+@@ -1234,7 +1235,7 @@ select_payloader (GList *filtered_list)
+       payloader_factory = NULL;
+     }
+     // Avoid non payloader elements that cab be confused
+-    factory_name = gst_object_get_name (GST_OBJECT(payloader_factory));
++    factory_name = gst_object_get_name (GST_OBJECT (payloader_factory));
+     if (g_str_equal ("rtpredenc", factory_name)) {
+       payloader_factory = NULL;
+     }
+@@ -1248,51 +1249,45 @@ select_payloader (GList *filtered_list)
+   }
+ 
+   return payloader_factory;
+-
+ }
+ 
+-static GstElementFactory*
+-search_payloader(const GstCaps *caps)
++static GstElementFactory *
++search_payloader (const GstCaps *caps)
+ {
+   GList *payloader_list, *filtered_list;
+   GstElementFactory *payloader_factory = NULL;
+ 
+-  payloader_list =
+-      gst_element_factory_list_get_elements (GST_ELEMENT_FACTORY_TYPE_PAYLOADER,
+-      GST_RANK_NONE);
++  payloader_list = gst_element_factory_list_get_elements (
++      GST_ELEMENT_FACTORY_TYPE_PAYLOADER, GST_RANK_NONE);
+ 
+   filtered_list =
+-      gst_element_factory_list_filter (payloader_list, caps, GST_PAD_SRC,
+-      TRUE);
++      gst_element_factory_list_filter (payloader_list, caps, GST_PAD_SRC, TRUE);
+ 
+   payloader_factory = select_payloader (filtered_list);
+-  
++
+   if (payloader_factory == NULL) {
+     gst_plugin_feature_list_free (filtered_list);
+-    filtered_list = 
+-      gst_element_factory_list_filter (payloader_list, caps, GST_PAD_SRC,
+-      FALSE);
++    filtered_list = gst_element_factory_list_filter (payloader_list, caps,
++        GST_PAD_SRC, FALSE);
+ 
+-      payloader_factory = select_payloader (filtered_list);
++    payloader_factory = select_payloader (filtered_list);
+   }
+ 
+   gst_plugin_feature_list_free (filtered_list);
+   gst_plugin_feature_list_free (payloader_list);
+ 
+   return payloader_factory;
+-
+ }
+ 
+-
+ static GstElement *
+-kms_base_rtp_endpoint_get_payloader_for_caps (KmsBaseRtpEndpoint * self,
+-    GstCaps * caps)
++kms_base_rtp_endpoint_get_payloader_for_caps (KmsBaseRtpEndpoint *self,
++    GstCaps *caps)
+ {
+   GstElementFactory *factory;
+   GstElement *payloader = NULL;
+   GParamSpec *pspec;
+ 
+-  factory =  search_payloader (caps);
++  factory = search_payloader (caps);
+ 
+   if (factory == NULL) {
+     goto end;
+@@ -1310,15 +1305,13 @@ kms_base_rtp_endpoint_get_payloader_for_caps (KmsBaseRtpEndpoint * self,
+     }
+   }
+ 
+-  pspec =
+-      g_object_class_find_property (G_OBJECT_GET_CLASS (payloader),
++  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (payloader),
+       "config-interval");
+   if (pspec != NULL && G_PARAM_SPEC_VALUE_TYPE (pspec) == G_TYPE_INT) {
+     g_object_set (payloader, "config-interval", 1, NULL);
+   }
+ 
+-  pspec =
+-      g_object_class_find_property (G_OBJECT_GET_CLASS (payloader),
++  pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (payloader),
+       "picture-id-mode");
+   if (pspec != NULL && G_TYPE_IS_ENUM (G_PARAM_SPEC_VALUE_TYPE (pspec))) {
+     /* Set picture id so that remote peer can determine continuity if there */
+@@ -1337,18 +1330,16 @@ end:
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps * caps)
++kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps *caps)
+ {
+   GstElementFactory *factory;
+   GstElement *depayloader = NULL;
+   GList *payloader_list, *filtered_list, *l;
+ 
+-  payloader_list =
+-      gst_element_factory_list_get_elements
+-      (GST_ELEMENT_FACTORY_TYPE_DEPAYLOADER, GST_RANK_NONE);
+-  filtered_list =
+-      gst_element_factory_list_filter (payloader_list, caps, GST_PAD_SINK,
+-      FALSE);
++  payloader_list = gst_element_factory_list_get_elements (
++      GST_ELEMENT_FACTORY_TYPE_DEPAYLOADER, GST_RANK_NONE);
++  filtered_list = gst_element_factory_list_filter (payloader_list, caps,
++      GST_PAD_SINK, FALSE);
+ 
+   if (filtered_list == NULL) {
+     goto end;
+@@ -1361,7 +1352,8 @@ kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps * caps)
+       continue;
+     }
+ 
+-    if (g_strcmp0 (gst_plugin_feature_get_name (factory), "asteriskh263") == 0) {
++    if (g_strcmp0 (gst_plugin_feature_get_name (factory), "asteriskh263")
++        == 0) {
+       /* Do not use asteriskh263 for H263 */
+       continue;
+     }
+@@ -1382,17 +1374,22 @@ end:
+ }
+ 
+ static void
+-add_mark_data_cb (GstPad * pad, KmsMediaType type, GstClockTimeDiff t,
+-    KmsList * meta_data, gpointer user_data)
++add_mark_data_cb (GstPad *pad,
++    KmsMediaType type,
++    GstClockTimeDiff t,
++    KmsList *meta_data,
++    gpointer user_data)
+ {
+-  E2EProbeData *data = (E2EProbeData *) user_data;
++  E2EProbeData *data = (E2EProbeData *)user_data;
+   StreamE2EAvgStat *stat;
+ 
+   stat = kms_list_lookup (meta_data, data->id);
+ 
+   if (stat != NULL) {
+-    GST_WARNING_OBJECT (pad, "Can not mark buffer for e2e latency. "
+-        "Already used ID: %s", data->id);
++    GST_WARNING_OBJECT (pad,
++        "Can not mark buffer for e2e latency. "
++        "Already used ID: %s",
++        data->id);
+   } else {
+     /* add mark data to this meta */
+     kms_list_prepend (meta_data, g_strdup (data->id),
+@@ -1401,8 +1398,9 @@ add_mark_data_cb (GstPad * pad, KmsMediaType type, GstClockTimeDiff t,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_configure_2e2_latency (KmsBaseRtpEndpoint * self,
+-    GstPad * pad, KmsElementPadType padtype)
++kms_base_rtp_endpoint_configure_2e2_latency (KmsBaseRtpEndpoint *self,
++    GstPad *pad,
++    KmsElementPadType padtype)
+ {
+   StreamE2EAvgStat *stat;
+   E2EProbeData *data;
+@@ -1410,16 +1408,16 @@ kms_base_rtp_endpoint_configure_2e2_latency (KmsBaseRtpEndpoint * self,
+   gchar *id;
+ 
+   switch (padtype) {
+-    case KMS_ELEMENT_PAD_TYPE_AUDIO:
+-      type = KMS_MEDIA_TYPE_AUDIO;
+-      break;
+-    case KMS_ELEMENT_PAD_TYPE_VIDEO:
+-      type = KMS_MEDIA_TYPE_VIDEO;
+-      break;
+-    default:
+-      GST_DEBUG_OBJECT (self, "No e2e stats will be collected for pad type %u",
+-          padtype);
+-      return;
++  case KMS_ELEMENT_PAD_TYPE_AUDIO:
++    type = KMS_MEDIA_TYPE_AUDIO;
++    break;
++  case KMS_ELEMENT_PAD_TYPE_VIDEO:
++    type = KMS_MEDIA_TYPE_VIDEO;
++    break;
++  default:
++    GST_DEBUG_OBJECT (self, "No e2e stats will be collected for pad type %u",
++        padtype);
++    return;
+   }
+ 
+   id = kms_stats_create_id_for_pad (GST_ELEMENT (self), pad);
+@@ -1440,11 +1438,11 @@ kms_base_rtp_endpoint_configure_2e2_latency (KmsBaseRtpEndpoint * self,
+   KMS_ELEMENT_UNLOCK (self);
+ 
+   kms_stats_add_buffer_latency_notification_probe (pad, add_mark_data_cb,
+-      TRUE /* lock the data */ , data, (GDestroyNotify) e2e_probe_data_destroy);
++      TRUE /* lock the data */, data, (GDestroyNotify)e2e_probe_data_destroy);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_do_connect_payloader (ConnectPayloaderData * data)
++kms_base_rtp_endpoint_do_connect_payloader (ConnectPayloaderData *data)
+ {
+   GST_DEBUG_OBJECT (data->self, "Connecting payloader %" GST_PTR_FORMAT,
+       data->payloader);
+@@ -1466,8 +1464,7 @@ kms_base_rtp_endpoint_do_connect_payloader (ConnectPayloaderData * data)
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_connect_payloader_cb (KmsIRtpConnection * conn,
+-    gpointer d)
++kms_base_rtp_endpoint_connect_payloader_cb (KmsIRtpConnection *conn, gpointer d)
+ {
+   ConnectPayloaderData *data = d;
+ 
+@@ -1480,8 +1477,10 @@ kms_base_rtp_endpoint_connect_payloader_cb (KmsIRtpConnection * conn,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_connect_payloader_async (KmsBaseRtpEndpoint * self,
+-    KmsIRtpConnection * conn, GstElement * payloader, KmsElementPadType type)
++kms_base_rtp_endpoint_connect_payloader_async (KmsBaseRtpEndpoint *self,
++    KmsIRtpConnection *conn,
++    GstElement *payloader,
++    KmsElementPadType type)
+ {
+   ConnectPayloaderData *data;
+   gboolean connected = FALSE;
+@@ -1492,7 +1491,7 @@ kms_base_rtp_endpoint_connect_payloader_async (KmsBaseRtpEndpoint * self,
+   handler_id = g_signal_connect_data (conn, "connected",
+       G_CALLBACK (kms_base_rtp_endpoint_connect_payloader_cb),
+       kms_ref_struct_ref (KMS_REF_STRUCT_CAST (data)),
+-      (GClosureNotify) kms_ref_struct_unref, 0);
++      (GClosureNotify)kms_ref_struct_unref, 0);
+ 
+   g_object_get (conn, "connected", &connected, NULL);
+ 
+@@ -1510,9 +1509,11 @@ kms_base_rtp_endpoint_connect_payloader_async (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_connect_payloader (KmsBaseRtpEndpoint * self,
+-    KmsIRtpConnection * conn, KmsElementPadType type, GstElement * payloader,
+-    const gchar * rtpbin_pad_name)
++kms_base_rtp_endpoint_connect_payloader (KmsBaseRtpEndpoint *self,
++    KmsIRtpConnection *conn,
++    KmsElementPadType type,
++    GstElement *payloader,
++    const gchar *rtpbin_pad_name)
+ {
+   GstElement *rtpbin = self->priv->rtpbin;
+   GstElement *input_element;
+@@ -1521,14 +1522,14 @@ kms_base_rtp_endpoint_connect_payloader (KmsBaseRtpEndpoint * self,
+   gst_bin_add (GST_BIN (self), payloader);
+   gst_element_sync_state_with_parent (payloader);
+ 
+-  payloader_name = gst_object_get_name (GST_OBJECT(payloader));
++  payloader_name = gst_object_get_name (GST_OBJECT (payloader));
+   if (g_str_has_prefix (payloader_name, "rtpav1pay")) {
+     GstElement *parser = gst_element_factory_make ("av1parse", NULL);
+ 
+     // FIXME: we could set it automatically using the auto-header-extension
+     // and not setting it on kms_base_rtp_endpoint_add_rtp_hdr_ext_probe on kmsbasertpendpoint.c
+     g_object_set (payloader, "auto-header-extension", FALSE, NULL);
+-    gst_bin_add (GST_BIN(self), parser);
++    gst_bin_add (GST_BIN (self), parser);
+     gst_element_sync_state_with_parent (parser);
+     gst_element_link (parser, payloader);
+     input_element = parser;
+@@ -1537,16 +1538,17 @@ kms_base_rtp_endpoint_connect_payloader (KmsBaseRtpEndpoint * self,
+   }
+   g_free (payloader_name);
+ 
+-
+   gst_element_link_pads (payloader, "src", rtpbin, rtpbin_pad_name);
+ 
+-  kms_base_rtp_endpoint_connect_payloader_async (self, conn, input_element, type);
++  kms_base_rtp_endpoint_connect_payloader_async (self, conn, input_element,
++      type);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_set_media_payloader (KmsBaseRtpEndpoint * self,
+-    KmsBaseRtpSession * sess, KmsSdpMediaHandler * handler,
+-    const GstSDPMedia * media)
++kms_base_rtp_endpoint_set_media_payloader (KmsBaseRtpEndpoint *self,
++    KmsBaseRtpSession *sess,
++    KmsSdpMediaHandler *handler,
++    const GstSDPMedia *media)
+ {
+   const gchar *media_str = gst_sdp_media_get_media (media);
+   GstElement *payloader;
+@@ -1609,8 +1611,8 @@ kms_base_rtp_endpoint_set_media_payloader (KmsBaseRtpEndpoint * self,
+ /* Payloading configuration end */
+ 
+ static void
+-kms_base_rtp_endpoint_connect_input_elements (KmsBaseSdpEndpoint *
+-    base_endpoint, KmsSdpSession * sess)
++kms_base_rtp_endpoint_connect_input_elements (KmsBaseSdpEndpoint *base_endpoint,
++    KmsSdpSession *sess)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (base_endpoint);
+   KmsBaseRtpSession *base_rtp_sess = KMS_BASE_RTP_SESSION (sess);
+@@ -1637,8 +1639,8 @@ kms_base_rtp_endpoint_connect_input_elements (KmsBaseSdpEndpoint *
+ 
+     media = gst_sdp_media_get_media (neg_media);
+ 
+-    if (g_strcmp0 (media, AUDIO_STREAM_NAME) == 0 ||
+-        g_strcmp0 (media, VIDEO_STREAM_NAME) == 0) {
++    if (g_strcmp0 (media, AUDIO_STREAM_NAME) == 0
++        || g_strcmp0 (media, VIDEO_STREAM_NAME) == 0) {
+       kms_base_rtp_endpoint_set_media_payloader (self, base_rtp_sess, handler,
+           neg_media);
+     }
+@@ -1650,16 +1652,36 @@ kms_base_rtp_endpoint_connect_input_elements (KmsBaseSdpEndpoint *
+ /* Connect input elements end */
+ 
+ static void
+-connection_state_changed (KmsSdpSession * sess, guint new_state,
+-    KmsBaseRtpEndpoint * self)
++connection_state_changed (KmsSdpSession *sess,
++    guint new_state,
++    KmsBaseRtpEndpoint *self)
+ {
+   g_signal_emit (self, obj_signals[CONNECTION_STATE_CHANGED], 0, sess->id_str,
+       new_state);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_create_session_internal (KmsBaseSdpEndpoint * base_sdp,
+-    gint id, KmsSdpSession ** sess)
++dtmf_event_detected (KmsBaseRtpSession *session,
++    gint number,
++    gboolean end,
++    gint volume,
++    gint duration,
++    const gchar *media_type,
++    KmsBaseRtpEndpoint *self)
++{
++  // You can now react to the detected DTMF
++  g_print ("[DTMF DETECTED] num=%d end=%d vol=%d dur=%d media=%s\n", number,
++      end, volume, duration, media_type ? media_type : "unknown");
++
++  // Optionally re-emit on endpoint (if needed elsewhere)
++  g_signal_emit (self, obj_signals[DTMF_EVENT_DETECTED], 0, number, end, volume,
++      duration, media_type);
++}
++
++static void
++kms_base_rtp_endpoint_create_session_internal (KmsBaseSdpEndpoint *base_sdp,
++    gint id,
++    KmsSdpSession **sess)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (base_sdp);
+   gboolean media_stats;
+@@ -1678,24 +1700,28 @@ kms_base_rtp_endpoint_create_session_internal (KmsBaseSdpEndpoint * base_sdp,
+   g_object_get (base_sdp, "media-stats", &media_stats, NULL);
+ 
+   if (media_stats) {
+-    kms_base_rtp_session_enable_connections_stats (KMS_BASE_RTP_SESSION
+-        (*sess));
++    kms_base_rtp_session_enable_connections_stats (
++        KMS_BASE_RTP_SESSION (*sess));
+   }
+ 
+   g_signal_connect (*sess, "connection-state-changed",
+-      (GCallback) connection_state_changed, self);
++      (GCallback)connection_state_changed, self);
+ 
++  g_signal_connect (*sess, "dtmf-event-detected",
++      G_CALLBACK (dtmf_event_detected),
++      self // user_data
++  );
+ end:
+ 
+   /* Chain up */
+-  KMS_BASE_SDP_ENDPOINT_CLASS
+-      (kms_base_rtp_endpoint_parent_class)->create_session_internal (base_sdp,
+-      id, sess);
++  KMS_BASE_SDP_ENDPOINT_CLASS (kms_base_rtp_endpoint_parent_class)
++      ->create_session_internal (base_sdp, id, sess);
+ }
+ 
+ static void
+-complete_caps_with_fb (GstCaps * caps, const GstSDPMedia * media,
+-    const gchar * payload)
++complete_caps_with_fb (GstCaps *caps,
++    const GstSDPMedia *media,
++    const gchar *payload)
+ {
+   gboolean fir, pli;
+   guint a;
+@@ -1730,7 +1756,7 @@ complete_caps_with_fb (GstCaps * caps, const GstSDPMedia * media,
+ }
+ 
+ static void
+-str_remove_white_spaces (gchar * src)
++str_remove_white_spaces (gchar *src)
+ {
+   gchar *wr, *r;
+ 
+@@ -1743,7 +1769,7 @@ str_remove_white_spaces (gchar * src)
+ }
+ 
+ static void
+-complement_caps_with_fmtp_attrs (GstCaps * caps, const gchar * fmtp_attr)
++complement_caps_with_fmtp_attrs (GstCaps *caps, const gchar *fmtp_attr)
+ {
+   gchar **attrs, **vars, *params;
+ 
+@@ -1792,8 +1818,8 @@ complement_caps_with_fmtp_attrs (GstCaps * caps, const gchar * fmtp_attr)
+     const gsize index = (gsize)index_ptr;
+ 
+     gchar *key = g_strndup (vars[i], index);
+-    gchar *value = g_strndup (vars[i] + index + 1,
+-        strlen (vars[i]) - index - 1);
++    gchar *value =
++        g_strndup (vars[i] + index + 1, strlen (vars[i]) - index - 1);
+ 
+     gst_caps_set_simple (caps, key, G_TYPE_STRING, value, NULL);
+ 
+@@ -1809,7 +1835,7 @@ end:
+ }
+ 
+ static GstCaps *
+-kms_base_rtp_endpoint_get_caps_for_pt (KmsBaseRtpEndpoint * self, guint pt)
++kms_base_rtp_endpoint_get_caps_for_pt (KmsBaseRtpEndpoint *self, guint pt)
+ {
+   KmsBaseSdpEndpoint *base_endpoint = KMS_BASE_SDP_ENDPOINT (self);
+   const GstSDPMessage *sdp =
+@@ -1839,8 +1865,7 @@ kms_base_rtp_endpoint_get_caps_for_pt (KmsBaseRtpEndpoint * self, guint pt)
+       }
+ 
+       rtpmap = sdp_utils_sdp_media_get_rtpmap (media, payload);
+-      caps =
+-          kms_base_rtp_endpoint_get_caps_from_rtpmap (media_str, payload,
++      caps = kms_base_rtp_endpoint_get_caps_from_rtpmap (media_str, payload,
+           rtpmap);
+ 
+       if (caps == NULL) {
+@@ -1864,8 +1889,10 @@ kms_base_rtp_endpoint_get_caps_for_pt (KmsBaseRtpEndpoint * self, guint pt)
+ }
+ 
+ static GstCaps *
+-kms_base_rtp_endpoint_rtpbin_request_pt_map (GstElement * rtpbin, guint session,
+-    guint pt, KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_rtpbin_request_pt_map (GstElement *rtpbin,
++    guint session,
++    guint pt,
++    KmsBaseRtpEndpoint *self)
+ {
+   GstCaps *caps;
+ 
+@@ -1878,8 +1905,7 @@ kms_base_rtp_endpoint_rtpbin_request_pt_map (GstElement * rtpbin, guint session,
+     return caps;
+   }
+ 
+-  caps =
+-      gst_caps_new_simple ("application/x-rtp", "payload", G_TYPE_INT, pt,
++  caps = gst_caps_new_simple ("application/x-rtp", "payload", G_TYPE_INT, pt,
+       NULL);
+ 
+   GST_WARNING_OBJECT (self, "Caps not found pt: %d. Setting: %" GST_PTR_FORMAT,
+@@ -1889,8 +1915,9 @@ kms_base_rtp_endpoint_rtpbin_request_pt_map (GstElement * rtpbin, guint session,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_update_stats (KmsBaseRtpEndpoint * self,
+-    GstElement * depayloader, KmsMediaType media)
++kms_base_rtp_endpoint_update_stats (KmsBaseRtpEndpoint *self,
++    GstElement *depayloader,
++    KmsMediaType media)
+ {
+   KmsStatsProbe *probe;
+   GstPad *pad;
+@@ -1910,9 +1937,120 @@ kms_base_rtp_endpoint_update_stats (KmsBaseRtpEndpoint * self,
+   KMS_ELEMENT_UNLOCK (self);
+ }
+ 
++// static void
++// on_dtmf_event (GstElement *depayloader, GstStructure *event, gpointer user_data)
++// {
++//   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
++
++//   if (event != NULL) {
++//     gint type, number, volume, duration;
++//     gboolean state;
++
++//     /* Extract DTMF event information */
++//     if (gst_structure_get_int (event, "type", &type)
++//         && gst_structure_get_int (event, "number", &number)
++//         && gst_structure_get_int (event, "volume", &volume)
++//         && gst_structure_get_int (event, "duration", &duration)
++//         && gst_structure_get_boolean (event, "state", &state)) {
++
++//       GST_INFO_OBJECT (self,
++//           "DTMF Event: type=%d, number=%d, volume=%d, duration=%d, state=%s",
++//           type, number, volume, duration, state ? "start" : "end");
++
++//       /* Here you can emit your own signal or call a callback to handle DTMF */
++//       /* For example: */
++//       /* g_signal_emit (self, dtmf_signals[DTMF_RECEIVED], 0, number, state); */
++//     }
++//   }
++// }
++
++static gboolean
++is_dtmf_caps (GstCaps *caps)
++{
++  GstStructure *s;
++  const gchar *encoding_name;
++
++  if (caps == NULL || gst_caps_is_empty (caps)) {
++    return FALSE;
++  }
++
++  s = gst_caps_get_structure (caps, 0);
++  if (s == NULL) {
++    return FALSE;
++  }
++
++  encoding_name = gst_structure_get_string (s, "encoding-name");
++  if (encoding_name == NULL) {
++    return FALSE;
++  }
++
++  return g_strcmp0 (encoding_name, "telephone-event") == 0;
++}
++
++// static GstBusSyncReply
++// kms_base_rtp_session_dtmf_bus_handler (GstBus *bus,
++//     GstMessage *msg,
++//     KmsBaseRtpSession *self)
++// {
++//   switch (GST_MESSAGE_TYPE (msg)) {
++//   case GST_MESSAGE_ELEMENT: {
++//     const GstStructure *s = gst_message_get_structure (msg);
++//     if (gst_structure_has_name (s, "dtmf-event")) {
++//       gint number, volume, duration;
++//       gboolean end;
++
++//       gst_structure_get_int (s, "number", &number);
++//       gst_structure_get_boolean (s, "end", &end);
++//       gst_structure_get_int (s, "volume", &volume);
++//       gst_structure_get_int (s, "duration", &duration);
++
++//       g_print (
++//           "[PANKAJ DTMF DETECTED] Number: %d, End: %s, Volume: %d, Duration: %d\n",
++//           number, end ? "true" : "false", volume, duration);
++
++//       // Emit the DTMF_EVENT_DETECTED signal
++//       g_signal_emit (self, obj_signals[DTMF_EVENT_DETECTED], 0, number, end,
++//           volume, duration, "audio");
++
++//       GST_INFO_OBJECT (self,
++//           "DTMF Event: number=%d, end=%s, volume=%d, duration=%d", number,
++//           end ? "true" : "false", volume, duration);
++
++//     } else {
++//       // Let other element messages pass through
++//       return GST_BUS_PASS;
++//     }
++//     break;
++//   }
++//   default:
++//     return GST_BUS_PASS;
++//   }
++
++//   return GST_BUS_PASS;
++// }
++
++/* Combined function to setup DTMF message handling */
++// static void
++// setup_dtmf_message_handler (GstElement *self)
++// {
++//   GstBus *pipeline_bus = gst_element_get_bus (GST_ELEMENT (self));
++//   if (!pipeline_bus) {
++//     g_print ("Pankaj Failed to get pipeline bus for DTMF handler setup\n");
++//     return;
++//   }
++
++//   /* Set the sync handler to process DTMF events */
++//   gst_bus_set_sync_handler (pipeline_bus,
++//       (GstBusSyncHandler)kms_base_rtp_session_dtmf_bus_handler, self, NULL);
++
++//   gst_object_unref (pipeline_bus);
++//   g_print ("Pankaj Set up DTMF message handler\n");
++// }
++
+ static void
+-kms_base_rtp_endpoint_rtpbin_pad_added (GstElement * rtpbin, GstPad * pad,
+-    KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_rtpbin_pad_added (GstElement *rtpbin,
++    GstPad *pad,
++    KmsBaseRtpEndpoint *self)
+ {
+   GstElement *agnostic, *depayloader;
+   gboolean added = TRUE;
+@@ -1920,12 +2058,13 @@ kms_base_rtp_endpoint_rtpbin_pad_added (GstElement * rtpbin, GstPad * pad,
+   GstCaps *caps;
+ 
+   GST_PAD_STREAM_LOCK (pad);
++  caps = gst_pad_query_caps (pad, NULL);
+ 
+   if (g_str_has_prefix (GST_OBJECT_NAME (pad), AUDIO_RTPBIN_RECV_RTP_SRC)) {
+     agnostic = kms_element_get_audio_agnosticbin (KMS_ELEMENT (self));
+     media = KMS_MEDIA_TYPE_AUDIO;
+   } else if (g_str_has_prefix (GST_OBJECT_NAME (pad),
+-          VIDEO_RTPBIN_RECV_RTP_SRC)) {
++                 VIDEO_RTPBIN_RECV_RTP_SRC)) {
+     agnostic = kms_element_get_video_agnosticbin (KMS_ELEMENT (self));
+     media = KMS_MEDIA_TYPE_VIDEO;
+ 
+@@ -1937,33 +2076,77 @@ kms_base_rtp_endpoint_rtpbin_pad_added (GstElement * rtpbin, GstPad * pad,
+     goto end;
+   }
+ 
+-  caps = gst_pad_query_caps (pad, NULL);
+   GST_DEBUG_OBJECT (self,
+       "New pad: %" GST_PTR_FORMAT " for linking to %" GST_PTR_FORMAT
+-      " with caps %" GST_PTR_FORMAT, pad, agnostic, caps);
++      " with caps %" GST_PTR_FORMAT,
++      pad, agnostic, caps);
+ 
+-  depayloader = kms_base_rtp_endpoint_get_depayloader_for_caps (caps);
++  /* Check if this is a DTMF stream */
++
++  if (is_dtmf_caps (caps)) {
++    GstElement *fakesink =
++        kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
++    GstPad *sink_pad;
+ 
++    g_object_set (fakesink, "async", FALSE, "sync", FALSE, NULL);
++    gst_bin_add (GST_BIN (self), fakesink);
++    gst_element_sync_state_with_parent (fakesink);
++
++    sink_pad = gst_element_get_static_pad (fakesink, "sink");
++    if (sink_pad != NULL) {
++      if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
++        GST_ERROR_OBJECT (self, "Failed to link DTMF pad to fakesink");
++      } else {
++        GST_INFO_OBJECT (self, "Linked DTMF pad %s directly to fakesink",
++            GST_OBJECT_NAME (pad));
++      }
++      gst_object_unref (sink_pad);
++    }
++
++    gst_caps_unref (caps);
++    // setup_dtmf_message_handler (fakesink);
++    goto end; /* skip rest of the normal media handling */
++  }
++  /* Handle regular (non-DTMF) streams */
++  depayloader = kms_base_rtp_endpoint_get_depayloader_for_caps (caps);
+   gst_caps_unref (caps);
+ 
+   if (depayloader != NULL) {
+     GST_DEBUG_OBJECT (self, "Found depayloader %" GST_PTR_FORMAT, depayloader);
+     kms_base_rtp_endpoint_update_stats (self, depayloader, media);
+     gst_bin_add (GST_BIN (self), depayloader);
+-    gst_element_link_pads (depayloader, "src", agnostic, "sink");
+-    gst_element_link_pads (rtpbin, GST_OBJECT_NAME (pad), depayloader, "sink");
+     gst_element_sync_state_with_parent (depayloader);
++
++    /* Link depayloader -> agnostic first */
++    if (gst_element_link_pads (depayloader, "src", agnostic, "sink")) {
++      /* Then link rtpbin -> depayloader */
++      GstPad *sink_pad = gst_element_get_static_pad (depayloader, "sink");
++      if (sink_pad != NULL) {
++        if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
++          GST_ERROR_OBJECT (self, "Failed to link rtpbin pad to depayloader");
++        }
++        gst_object_unref (sink_pad);
++      }
++    } else {
++      GST_ERROR_OBJECT (self, "Failed to link depayloader to agnostic");
++    }
+   } else {
+     GstElement *fake = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
++    GstPad *sink_pad;
+ 
+     g_object_set (fake, "async", FALSE, "sync", FALSE, NULL);
+ 
+-    GST_WARNING_OBJECT (self, "Depayloder not found for pad %" GST_PTR_FORMAT,
++    GST_WARNING_OBJECT (self, "Depayloader not found for pad %" GST_PTR_FORMAT,
+         pad);
+ 
+     gst_bin_add (GST_BIN (self), fake);
+-    gst_element_link_pads (rtpbin, GST_OBJECT_NAME (pad), fake, "sink");
+     gst_element_sync_state_with_parent (fake);
++
++    sink_pad = gst_element_get_static_pad (fake, "sink");
++    if (sink_pad != NULL) {
++      gst_pad_link (pad, sink_pad);
++      gst_object_unref (sink_pad);
++    }
+   }
+ 
+ end:
+@@ -1975,8 +2158,9 @@ end:
+ }
+ 
+ static GstPadProbeReturn
+-kms_base_rtp_endpoint_jitterbuffer_set_latency_probe (GstPad * pad,
+-    GstPadProbeInfo * info, gpointer user_data)
++kms_base_rtp_endpoint_jitterbuffer_set_latency_probe (GstPad *pad,
++    GstPadProbeInfo *info,
++    gpointer user_data)
+ {
+   GstElement *jitterbuffer = GST_PAD_PARENT (pad);
+   gint latency = GPOINTER_TO_INT (user_data);
+@@ -1991,7 +2175,7 @@ kms_base_rtp_endpoint_jitterbuffer_set_latency_probe (GstPad * pad,
+ 
+ // Latency is set only when there are actual buffers flowing out
+ static void
+-kms_base_rtp_endpoint_jitterbuffer_set_latency (GstElement * jitterbuffer,
++kms_base_rtp_endpoint_jitterbuffer_set_latency (GstElement *jitterbuffer,
+     gint latency)
+ {
+   GstPad *src_pad;
+@@ -2006,11 +2190,12 @@ kms_base_rtp_endpoint_jitterbuffer_set_latency (GstElement * jitterbuffer,
+   g_object_unref (src_pad);
+ }
+ 
+-
+ static void
+-kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement * rtpbin,
+-    GstElement * jitterbuffer,
+-    guint session, guint ssrc, KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement *rtpbin,
++    GstElement *jitterbuffer,
++    guint session,
++    guint ssrc,
++    KmsBaseRtpEndpoint *self)
+ {
+   KmsRTPSessionStats *rtp_stats;
+   KmsSSRCStats *ssrc_stats;
+@@ -2019,26 +2204,25 @@ kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement * rtpbin,
+       "latency", JB_INITIAL_LATENCY, NULL);
+ 
+   switch (session) {
+-    case AUDIO_RTP_SESSION: {
+-      kms_base_rtp_endpoint_jitterbuffer_set_latency (jitterbuffer,
+-          JB_READY_AUDIO_LATENCY);
++  case AUDIO_RTP_SESSION: {
++    kms_base_rtp_endpoint_jitterbuffer_set_latency (jitterbuffer,
++        JB_READY_AUDIO_LATENCY);
+ 
+-      break;
+-    }
+-    case VIDEO_RTP_SESSION: {
+-      kms_base_rtp_endpoint_jitterbuffer_set_latency (jitterbuffer,
+-          JB_READY_VIDEO_LATENCY);
++    break;
++  }
++  case VIDEO_RTP_SESSION: {
++    kms_base_rtp_endpoint_jitterbuffer_set_latency (jitterbuffer,
++        JB_READY_VIDEO_LATENCY);
+ 
+-      break;
+-    }
+-    default:
+-      break;
++    break;
++  }
++  default:
++    break;
+   }
+ 
+   KMS_ELEMENT_LOCK (self);
+ 
+-  rtp_stats =
+-      g_hash_table_lookup (self->priv->stats.rtp_stats,
++  rtp_stats = g_hash_table_lookup (self->priv->stats.rtp_stats,
+       GUINT_TO_POINTER (session));
+ 
+   if (rtp_stats != NULL) {
+@@ -2059,7 +2243,8 @@ kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement * rtpbin,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_stop_signal (KmsBaseRtpEndpoint * self, guint session,
++kms_base_rtp_endpoint_stop_signal (KmsBaseRtpEndpoint *self,
++    guint session,
+     guint ssrc)
+ {
+   gboolean local = TRUE;
+@@ -2080,23 +2265,23 @@ kms_base_rtp_endpoint_stop_signal (KmsBaseRtpEndpoint * self, guint session,
+   KMS_ELEMENT_UNLOCK (self);
+ 
+   switch (session) {
+-    case AUDIO_RTP_SESSION:
+-      media = KMS_MEDIA_TYPE_AUDIO;
+-      break;
+-    case VIDEO_RTP_SESSION:
+-      media = KMS_MEDIA_TYPE_VIDEO;
+-      break;
+-    default:
+-      GST_WARNING_OBJECT (self, "No media supported for session %u", session);
+-      return;
++  case AUDIO_RTP_SESSION:
++    media = KMS_MEDIA_TYPE_AUDIO;
++    break;
++  case VIDEO_RTP_SESSION:
++    media = KMS_MEDIA_TYPE_VIDEO;
++    break;
++  default:
++    GST_WARNING_OBJECT (self, "No media supported for session %u", session);
++    return;
+   }
+ 
+   g_signal_emit (G_OBJECT (self), obj_signals[MEDIA_STOP], 0, media, local);
+ }
+ 
+ static void
+-ssrc_stats_add_jitter_stats (GstStructure * ssrc_stats,
+-    GstElement * jitter_buffer)
++ssrc_stats_add_jitter_stats (GstStructure *ssrc_stats,
++    GstElement *jitter_buffer)
+ {
+   GstStructure *jitter_stats;
+   guint percent, latency;
+@@ -2119,7 +2304,7 @@ ssrc_stats_add_jitter_stats (GstStructure * ssrc_stats,
+ }
+ 
+ static GstElement *
+-rtp_session_stats_get_jitter_buffer (KmsRTPSessionStats * rtp_stats, guint ssrc)
++rtp_session_stats_get_jitter_buffer (KmsRTPSessionStats *rtp_stats, guint ssrc)
+ {
+   GSList *e;
+ 
+@@ -2134,7 +2319,7 @@ rtp_session_stats_get_jitter_buffer (KmsRTPSessionStats * rtp_stats, guint ssrc)
+ }
+ 
+ static const GstStructure *
+-get_structure_from_id (const GstStructure * structure, const gchar * fieldname)
++get_structure_from_id (const GstStructure *structure, const gchar *fieldname)
+ {
+   const GValue *value;
+ 
+@@ -2159,8 +2344,11 @@ get_structure_from_id (const GstStructure * structure, const gchar * fieldname)
+ }
+ 
+ static void
+-set_outbound_additional_params (const GstStructure * session_stats,
+-    const gchar * ssrc_id, guint rtt, guint fraction_lost, gint packet_lost)
++set_outbound_additional_params (const GstStructure *session_stats,
++    const gchar *ssrc_id,
++    guint rtt,
++    guint fraction_lost,
++    gint packet_lost)
+ {
+   const GstStructure *ssrc_stats;
+ 
+@@ -2170,8 +2358,8 @@ set_outbound_additional_params (const GstStructure * session_stats,
+     return;
+   }
+ 
+-  gst_structure_set ((GstStructure *) ssrc_stats, "round-trip-time",
+-      G_TYPE_UINT, rtt, "outbound-fraction-lost", G_TYPE_UINT, fraction_lost,
++  gst_structure_set ((GstStructure *)ssrc_stats, "round-trip-time", G_TYPE_UINT,
++      rtt, "outbound-fraction-lost", G_TYPE_UINT, fraction_lost,
+       "outbound-packet-lost", G_TYPE_INT, packet_lost, NULL);
+ }
+ 
+@@ -2179,22 +2367,23 @@ static gboolean
+ filter_rtp_source (GstSDPDirection direction, gboolean internal)
+ {
+   switch (direction) {
+-    case GST_SDP_DIRECTION_SENDONLY:
+-      /* filter non internal sources */
+-      return !internal;
+-    case GST_SDP_DIRECTION_RECVONLY:
+-      /* filter internal sources */
+-      return internal;
+-    case GST_SDP_DIRECTION_SENDRECV:
+-      return FALSE;
+-    default:
+-      return TRUE;
++  case GST_SDP_DIRECTION_SENDONLY:
++    /* filter non internal sources */
++    return !internal;
++  case GST_SDP_DIRECTION_RECVONLY:
++    /* filter internal sources */
++    return internal;
++  case GST_SDP_DIRECTION_SENDRECV:
++    return FALSE;
++  default:
++    return TRUE;
+   }
+ }
+ 
+ static void
+-append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+-    GstStructure * stats)
++append_rtp_session_stats (gpointer *session,
++    KmsRTPSessionStats *rtp_stats,
++    GstStructure *stats)
+ {
+   GstStructure *session_stats;
+   gchar *str_session;
+@@ -2223,11 +2412,11 @@ append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+     guint source_ssrc;
+     const gchar *id;
+ 
+-    // FIXME 'g_value_array_get_nth' is deprecated: Use 'GArray' instead
+-    #pragma GCC diagnostic push
+-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++// FIXME 'g_value_array_get_nth' is deprecated: Use 'GArray' instead
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+     val = g_value_array_get_nth (arr, i);
+-    #pragma GCC diagnostic pop
++#pragma GCC diagnostic pop
+ 
+     source = g_value_get_object (val);
+ 
+@@ -2241,7 +2430,8 @@ append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+     // * !internal && !is-sender: "remote-inbound-rtp".
+ 
+     g_object_get (source, "stats", &source_stats, "ssrc", &source_ssrc, NULL);
+-    gst_structure_get (source_stats, "internal", G_TYPE_BOOLEAN, &internal, NULL);
++    gst_structure_get (source_stats, "internal", G_TYPE_BOOLEAN, &internal,
++        NULL);
+ 
+     name = g_strdup_printf ("ssrc-%u", source_ssrc);
+ 
+@@ -2276,7 +2466,8 @@ append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+ 
+     gst_structure_set (source_stats, "id", G_TYPE_STRING, id, NULL);
+ 
+-    jitter_buffer = rtp_session_stats_get_jitter_buffer (rtp_stats, source_ssrc);
++    jitter_buffer =
++        rtp_session_stats_get_jitter_buffer (rtp_stats, source_ssrc);
+ 
+     if (jitter_buffer != NULL) {
+       ssrc_stats_add_jitter_stats (source_stats, jitter_buffer);
+@@ -2295,11 +2486,11 @@ append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+     g_free (ssrc_id);
+   }
+ 
+-  // FIXME 'g_value_array_free' is deprecated: Use 'GArray' instead
+-  #pragma GCC diagnostic push
+-  #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++// FIXME 'g_value_array_free' is deprecated: Use 'GArray' instead
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+   g_value_array_free (arr);
+-  #pragma GCC diagnostic pop
++#pragma GCC diagnostic pop
+ 
+   str_session = g_strdup_printf ("session-%u", GPOINTER_TO_UINT (session));
+   gst_structure_set (stats, str_session, GST_TYPE_STRUCTURE, session_stats,
+@@ -2310,8 +2501,9 @@ append_rtp_session_stats (gpointer * session, KmsRTPSessionStats * rtp_stats,
+ }
+ 
+ static GstStructure *
+-kms_base_rtp_endpoint_add_rtp_stats (KmsBaseRtpEndpoint * self,
+-    GstStructure * stats, const gchar * selector)
++kms_base_rtp_endpoint_add_rtp_stats (KmsBaseRtpEndpoint *self,
++    GstStructure *stats,
++    const gchar *selector)
+ {
+   KmsRTPSessionStats *rtp_stats;
+   guint session_id;
+@@ -2319,7 +2511,7 @@ kms_base_rtp_endpoint_add_rtp_stats (KmsBaseRtpEndpoint * self,
+   if (selector == NULL) {
+     /* No selector provided. All stats will be generated */
+     g_hash_table_foreach (self->priv->stats.rtp_stats,
+-        (GHFunc) append_rtp_session_stats, stats);
++        (GHFunc)append_rtp_session_stats, stats);
+     return stats;
+   }
+ 
+@@ -2346,196 +2538,200 @@ kms_base_rtp_endpoint_add_rtp_stats (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_set_property (GObject * object, guint property_id,
+-    const GValue * value, GParamSpec * pspec)
++kms_base_rtp_endpoint_set_property (GObject *object,
++    guint property_id,
++    const GValue *value,
++    GParamSpec *pspec)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (object);
+ 
+   KMS_ELEMENT_LOCK (self);
+ 
+   switch (property_id) {
+-    case PROP_RTCP_MUX:
+-      self->priv->rtcp_mux = g_value_get_boolean (value);
+-      break;
+-    case PROP_RTCP_NACK:
+-      self->priv->rtcp_nack = g_value_get_boolean (value);
+-      break;
+-    case PROP_RTCP_REMB:
+-      self->priv->rtcp_remb = g_value_get_boolean (value);
+-      break;
+-    case PROP_MIN_VIDEO_RECV_BW:{
+-      guint v = g_value_get_uint (value);
+-
+-      guint max_recv_bw;
+-      g_object_get (self, "max-video-recv-bandwidth", &max_recv_bw, NULL);
+-
+-      if (max_recv_bw != 0 && v > max_recv_bw) {
+-        v = max_recv_bw;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set min > max. Setting %" G_GUINT32_FORMAT, v);
+-      }
+-
+-      self->priv->min_video_recv_bw = v;
+-      break;
++  case PROP_RTCP_MUX:
++    self->priv->rtcp_mux = g_value_get_boolean (value);
++    break;
++  case PROP_RTCP_NACK:
++    self->priv->rtcp_nack = g_value_get_boolean (value);
++    break;
++  case PROP_RTCP_REMB:
++    self->priv->rtcp_remb = g_value_get_boolean (value);
++    break;
++  case PROP_MIN_VIDEO_RECV_BW: {
++    guint v = g_value_get_uint (value);
++
++    guint max_recv_bw;
++    g_object_get (self, "max-video-recv-bandwidth", &max_recv_bw, NULL);
++
++    if (max_recv_bw != 0 && v > max_recv_bw) {
++      v = max_recv_bw;
++      GST_WARNING_OBJECT (object,
++          "Trying to set min > max. Setting %" G_GUINT32_FORMAT, v);
+     }
+-    case PROP_MIN_VIDEO_SEND_BW:{
+-      guint v = g_value_get_uint (value);
+ 
+-      if ((v != 0) && (v > self->priv->max_video_send_bw)) {
+-        v = self->priv->max_video_send_bw;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set min > max. Setting %" G_GUINT32_FORMAT, v);
+-      }
++    self->priv->min_video_recv_bw = v;
++    break;
++  }
++  case PROP_MIN_VIDEO_SEND_BW: {
++    guint v = g_value_get_uint (value);
+ 
+-      self->priv->min_video_send_bw = v;
+-      break;
++    if ((v != 0) && (v > self->priv->max_video_send_bw)) {
++      v = self->priv->max_video_send_bw;
++      GST_WARNING_OBJECT (object,
++          "Trying to set min > max. Setting %" G_GUINT32_FORMAT, v);
+     }
+-    case PROP_MAX_VIDEO_SEND_BW:{
+-      guint v = g_value_get_uint (value);
+ 
+-      if ((v != 0) && (v < self->priv->min_video_send_bw)) {
+-        v = self->priv->min_video_send_bw;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set max < min. Setting %" G_GUINT32_FORMAT, v);
+-      }
++    self->priv->min_video_send_bw = v;
++    break;
++  }
++  case PROP_MAX_VIDEO_SEND_BW: {
++    guint v = g_value_get_uint (value);
+ 
+-      self->priv->max_video_send_bw = v;
+-      break;
++    if ((v != 0) && (v < self->priv->min_video_send_bw)) {
++      v = self->priv->min_video_send_bw;
++      GST_WARNING_OBJECT (object,
++          "Trying to set max < min. Setting %" G_GUINT32_FORMAT, v);
+     }
+-    case PROP_REMB_PARAMS:
+-      if (self->priv->rl != NULL) {
+-        GstStructure *params = g_value_get_boxed (value);
+-
+-        GST_DEBUG_OBJECT (self,
+-            "Set to already created RembLocal and RembRemote");
+-        kms_remb_local_set_params (self->priv->rl, params);
+-        kms_remb_remote_set_params (self->priv->rm, params);
+-      } else {
+-        GST_DEBUG_OBJECT (self, "Set to aux structure");
+-        if (self->priv->remb_params != NULL) {
+-          gst_structure_free (self->priv->remb_params);
+-        }
+-        self->priv->remb_params = g_value_dup_boxed (value);
+-      }
+-      break;
+-    case PROP_MIN_PORT:{
+-      guint v = g_value_get_uint (value);
+ 
+-      if (v >= self->priv->max_port) {
+-        v = self->priv->max_port - 1;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set min-port >= max-port. Setting %" G_GUINT32_FORMAT, v);
+-      }
++    self->priv->max_video_send_bw = v;
++    break;
++  }
++  case PROP_REMB_PARAMS:
++    if (self->priv->rl != NULL) {
++      GstStructure *params = g_value_get_boxed (value);
+ 
+-      if (v < DEFAULT_MIN_PORT) {
+-        v = DEFAULT_MIN_PORT;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set min-port < 1024. Setting %" G_GUINT32_FORMAT, v);
++      GST_DEBUG_OBJECT (self,
++          "Set to already created RembLocal and RembRemote");
++      kms_remb_local_set_params (self->priv->rl, params);
++      kms_remb_remote_set_params (self->priv->rm, params);
++    } else {
++      GST_DEBUG_OBJECT (self, "Set to aux structure");
++      if (self->priv->remb_params != NULL) {
++        gst_structure_free (self->priv->remb_params);
+       }
++      self->priv->remb_params = g_value_dup_boxed (value);
++    }
++    break;
++  case PROP_MIN_PORT: {
++    guint v = g_value_get_uint (value);
++
++    if (v >= self->priv->max_port) {
++      v = self->priv->max_port - 1;
++      GST_WARNING_OBJECT (object,
++          "Trying to set min-port >= max-port. Setting %" G_GUINT32_FORMAT, v);
++    }
+ 
+-      self->priv->min_port = v;
+-      break;
++    if (v < DEFAULT_MIN_PORT) {
++      v = DEFAULT_MIN_PORT;
++      GST_WARNING_OBJECT (object,
++          "Trying to set min-port < 1024. Setting %" G_GUINT32_FORMAT, v);
+     }
+-    case PROP_MAX_PORT:{
+-      guint v = g_value_get_uint (value);
+ 
+-      if (v <= self->priv->min_port) {
+-        v = self->priv->min_port + 1;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set max-port <= min-port. Setting %" G_GUINT32_FORMAT, v);
+-      }
++    self->priv->min_port = v;
++    break;
++  }
++  case PROP_MAX_PORT: {
++    guint v = g_value_get_uint (value);
+ 
+-      if (v > DEFAULT_MAX_PORT) {
+-        v = DEFAULT_MAX_PORT;
+-        GST_WARNING_OBJECT (object,
+-            "Trying to set max-port > 65535. Setting %" G_GUINT32_FORMAT, v);
+-      }
++    if (v <= self->priv->min_port) {
++      v = self->priv->min_port + 1;
++      GST_WARNING_OBJECT (object,
++          "Trying to set max-port <= min-port. Setting %" G_GUINT32_FORMAT, v);
++    }
+ 
+-      self->priv->max_port = v;
+-      break;
++    if (v > DEFAULT_MAX_PORT) {
++      v = DEFAULT_MAX_PORT;
++      GST_WARNING_OBJECT (object,
++          "Trying to set max-port > 65535. Setting %" G_GUINT32_FORMAT, v);
+     }
+-    case PROP_MTU:
+-      self->priv->mtu = g_value_get_uint (value);
+-      break;
+-    case PROP_OFFER_DIR:
+-      self->priv->offer_dir = g_value_get_enum (value);
+-      break;
+-    default:
+-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+-      break;
++
++    self->priv->max_port = v;
++    break;
++  }
++  case PROP_MTU:
++    self->priv->mtu = g_value_get_uint (value);
++    break;
++  case PROP_OFFER_DIR:
++    self->priv->offer_dir = g_value_get_enum (value);
++    break;
++  default:
++    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++    break;
+   }
+ 
+   KMS_ELEMENT_UNLOCK (self);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_get_property (GObject * object, guint property_id,
+-    GValue * value, GParamSpec * pspec)
++kms_base_rtp_endpoint_get_property (GObject *object,
++    guint property_id,
++    GValue *value,
++    GParamSpec *pspec)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (object);
+ 
+   KMS_ELEMENT_LOCK (self);
+ 
+   switch (property_id) {
+-    case PROP_RTCP_MUX:
+-      g_value_set_boolean (value, self->priv->rtcp_mux);
+-      break;
+-    case PROP_RTCP_NACK:
+-      g_value_set_boolean (value, self->priv->rtcp_nack);
+-      break;
+-    case PROP_RTCP_REMB:
+-      g_value_set_boolean (value, self->priv->rtcp_remb);
+-      break;
+-    case PROP_MIN_VIDEO_RECV_BW:
+-      g_value_set_uint (value, self->priv->min_video_recv_bw);
+-    case PROP_MIN_VIDEO_SEND_BW:
+-      g_value_set_uint (value, self->priv->min_video_send_bw);
+-      break;
+-    case PROP_MAX_VIDEO_SEND_BW:
+-      g_value_set_uint (value, self->priv->max_video_send_bw);
+-      break;
+-    case PROP_MEDIA_STATE:
+-      g_value_set_enum (value, self->priv->media_state);
+-      break;
+-    case PROP_OFFER_DIR:
+-      g_value_set_enum (value, self->priv->offer_dir);
+-      break;
+-    case PROP_REMB_PARAMS:
+-      if (self->priv->rl != NULL) {
+-        GstStructure *params = gst_structure_new_empty ("remb-params");
+-
+-        GST_DEBUG_OBJECT (self,
+-            "Get from already created RembLocal and RembRemote");
+-        kms_remb_local_get_params (self->priv->rl, &params);
+-        kms_remb_remote_get_params (self->priv->rm, &params);
+-        g_value_take_boxed (value, params);
+-      } else if (self->priv->remb_params != NULL) {
+-        GST_DEBUG_OBJECT (self, "Get from aux structure");
+-        g_value_set_boxed (value, self->priv->remb_params);
+-      }
+-      break;
+-    case PROP_MIN_PORT:
+-      g_value_set_uint (value, self->priv->min_port);
+-      break;
+-    case PROP_MAX_PORT:
+-      g_value_set_uint (value, self->priv->max_port);
+-      break;
+-    case PROP_MTU:
+-      g_value_set_uint (value, self->priv->mtu);
+-      break;
+-    case PROP_SUPPORT_FEC:
+-      g_value_set_boolean (value, self->priv->support_fec);
+-      break;
+-    default:
+-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+-      break;
++  case PROP_RTCP_MUX:
++    g_value_set_boolean (value, self->priv->rtcp_mux);
++    break;
++  case PROP_RTCP_NACK:
++    g_value_set_boolean (value, self->priv->rtcp_nack);
++    break;
++  case PROP_RTCP_REMB:
++    g_value_set_boolean (value, self->priv->rtcp_remb);
++    break;
++  case PROP_MIN_VIDEO_RECV_BW:
++    g_value_set_uint (value, self->priv->min_video_recv_bw);
++  case PROP_MIN_VIDEO_SEND_BW:
++    g_value_set_uint (value, self->priv->min_video_send_bw);
++    break;
++  case PROP_MAX_VIDEO_SEND_BW:
++    g_value_set_uint (value, self->priv->max_video_send_bw);
++    break;
++  case PROP_MEDIA_STATE:
++    g_value_set_enum (value, self->priv->media_state);
++    break;
++  case PROP_OFFER_DIR:
++    g_value_set_enum (value, self->priv->offer_dir);
++    break;
++  case PROP_REMB_PARAMS:
++    if (self->priv->rl != NULL) {
++      GstStructure *params = gst_structure_new_empty ("remb-params");
++
++      GST_DEBUG_OBJECT (self,
++          "Get from already created RembLocal and RembRemote");
++      kms_remb_local_get_params (self->priv->rl, &params);
++      kms_remb_remote_get_params (self->priv->rm, &params);
++      g_value_take_boxed (value, params);
++    } else if (self->priv->remb_params != NULL) {
++      GST_DEBUG_OBJECT (self, "Get from aux structure");
++      g_value_set_boxed (value, self->priv->remb_params);
++    }
++    break;
++  case PROP_MIN_PORT:
++    g_value_set_uint (value, self->priv->min_port);
++    break;
++  case PROP_MAX_PORT:
++    g_value_set_uint (value, self->priv->max_port);
++    break;
++  case PROP_MTU:
++    g_value_set_uint (value, self->priv->mtu);
++    break;
++  case PROP_SUPPORT_FEC:
++    g_value_set_boolean (value, self->priv->support_fec);
++    break;
++  default:
++    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++    break;
+   }
+ 
+   KMS_ELEMENT_UNLOCK (self);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_dispose (GObject * gobject)
++kms_base_rtp_endpoint_dispose (GObject *gobject)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (gobject);
+ 
+@@ -2562,33 +2758,35 @@ kms_base_rtp_endpoint_dispose (GObject * gobject)
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_destroy_stats (KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_destroy_stats (KmsBaseRtpEndpoint *self)
+ {
+   g_hash_table_destroy (self->priv->stats.rtp_stats);
+   g_slist_free_full (self->priv->stats.probes,
+-      (GDestroyNotify) kms_stats_probe_destroy);
++      (GDestroyNotify)kms_stats_probe_destroy);
+   g_hash_table_unref (self->priv->stats.avg_e2e);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_enable_connections_stats (gpointer key, gpointer value,
++kms_base_rtp_endpoint_enable_connections_stats (gpointer key,
++    gpointer value,
+     gpointer user_data)
+ {
+   kms_base_rtp_session_enable_connections_stats (KMS_BASE_RTP_SESSION (value));
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_disable_connections_stats (gpointer key, gpointer value,
++kms_base_rtp_endpoint_disable_connections_stats (gpointer key,
++    gpointer value,
+     gpointer user_data)
+ {
+   if (KMS_IS_BASE_RTP_SESSION (value)) {
+-    kms_base_rtp_session_disable_connections_stats (KMS_BASE_RTP_SESSION
+-        (value));
++    kms_base_rtp_session_disable_connections_stats (
++        KMS_BASE_RTP_SESSION (value));
+   }
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_finalize (GObject * gobject)
++kms_base_rtp_endpoint_finalize (GObject *gobject)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (gobject);
+   KmsBaseSdpEndpoint *base_endpoint = KMS_BASE_SDP_ENDPOINT (self);
+@@ -2620,14 +2818,13 @@ kms_base_rtp_endpoint_finalize (GObject * gobject)
+   G_OBJECT_CLASS (kms_base_rtp_endpoint_parent_class)->finalize (gobject);
+ }
+ 
+-typedef struct _KmsRembStats
+-{
++typedef struct _KmsRembStats {
+   GstStructure *stats;
+   guint session;
+ } KmsRembStats;
+ 
+ static void
+-merge_remb_stats (gpointer key, guint * value, KmsRembStats * rs)
++merge_remb_stats (gpointer key, guint *value, KmsRembStats *rs)
+ {
+   guint ssrc = GPOINTER_TO_UINT (key);
+   gchar *session_id, *ssrc_id;
+@@ -2649,13 +2846,14 @@ merge_remb_stats (gpointer key, guint * value, KmsRembStats * rs)
+     return;
+   }
+ 
+-  gst_structure_set ((GstStructure *) ssrc_stats, "remb", G_TYPE_UINT, *value,
++  gst_structure_set ((GstStructure *)ssrc_stats, "remb", G_TYPE_UINT, *value,
+       NULL);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_append_remb_stats (KmsBaseRtpEndpoint * self,
+-    GstStructure * stats, gchar * selector)
++kms_base_rtp_endpoint_append_remb_stats (KmsBaseRtpEndpoint *self,
++    GstStructure *stats,
++    gchar *selector)
+ {
+   KmsRembStats rs;
+ 
+@@ -2668,7 +2866,7 @@ kms_base_rtp_endpoint_append_remb_stats (KmsBaseRtpEndpoint * self,
+     rs.stats = stats;
+     rs.session = VIDEO_RTP_SESSION;
+     g_hash_table_foreach (KMS_REMB_BASE (self->priv->rl)->remb_stats,
+-        (GHFunc) merge_remb_stats, &rs);
++        (GHFunc)merge_remb_stats, &rs);
+     KMS_REMB_BASE_UNLOCK (self->priv->rl);
+   }
+ 
+@@ -2677,13 +2875,13 @@ kms_base_rtp_endpoint_append_remb_stats (KmsBaseRtpEndpoint * self,
+     rs.stats = stats;
+     rs.session = VIDEO_RTP_SESSION;
+     g_hash_table_foreach (KMS_REMB_BASE (self->priv->rm)->remb_stats,
+-        (GHFunc) merge_remb_stats, &rs);
++        (GHFunc)merge_remb_stats, &rs);
+     KMS_REMB_BASE_UNLOCK (self->priv->rm);
+   }
+ }
+ 
+ static gchar *
+-kms_element_get_padname_from_id (KmsBaseRtpEndpoint * self, const gchar * id)
++kms_element_get_padname_from_id (KmsBaseRtpEndpoint *self, const gchar *id)
+ {
+   gchar *objname, *padname = NULL;
+ 
+@@ -2703,7 +2901,7 @@ end:
+ }
+ 
+ static GstStructure *
+-kms_element_get_e2e_latency_stats (KmsBaseRtpEndpoint * self, gchar * selector)
++kms_element_get_e2e_latency_stats (KmsBaseRtpEndpoint *self, gchar *selector)
+ {
+   gpointer key, value;
+   GHashTableIter iter;
+@@ -2720,10 +2918,11 @@ kms_element_get_e2e_latency_stats (KmsBaseRtpEndpoint * self, gchar * selector)
+     GstStructure *pad_latency;
+     gchar *padname, *id = key;
+ 
+-    if (selector != NULL && ((g_strcmp0 (selector, AUDIO_STREAM_NAME) == 0 &&
+-                avg->type != KMS_MEDIA_TYPE_AUDIO) ||
+-            (g_strcmp0 (selector, VIDEO_STREAM_NAME) == 0 &&
+-                avg->type != KMS_MEDIA_TYPE_VIDEO))) {
++    if (selector != NULL
++        && ((g_strcmp0 (selector, AUDIO_STREAM_NAME) == 0
++                && avg->type != KMS_MEDIA_TYPE_AUDIO)
++            || (g_strcmp0 (selector, VIDEO_STREAM_NAME) == 0
++                && avg->type != KMS_MEDIA_TYPE_VIDEO))) {
+       continue;
+     }
+ 
+@@ -2739,9 +2938,9 @@ kms_element_get_e2e_latency_stats (KmsBaseRtpEndpoint * self, gchar * selector)
+     /* to uint64 even we might lose a bit of preccision.            */
+ 
+     pad_latency = gst_structure_new (padname, "type", G_TYPE_STRING,
+-        (avg->type ==
+-            KMS_MEDIA_TYPE_AUDIO) ? AUDIO_STREAM_NAME : VIDEO_STREAM_NAME,
+-        "avg", G_TYPE_UINT64, (guint64) avg->avg, NULL);
++        (avg->type == KMS_MEDIA_TYPE_AUDIO) ? AUDIO_STREAM_NAME
++                                            : VIDEO_STREAM_NAME,
++        "avg", G_TYPE_UINT64, (guint64)avg->avg, NULL);
+ 
+     gst_structure_set (stats, padname, GST_TYPE_STRUCTURE, pad_latency, NULL);
+     gst_structure_free (pad_latency);
+@@ -2754,15 +2953,14 @@ kms_element_get_e2e_latency_stats (KmsBaseRtpEndpoint * self, gchar * selector)
+ }
+ 
+ static GstStructure *
+-kms_base_rtp_endpoint_stats (KmsElement * obj, gchar * selector)
++kms_base_rtp_endpoint_stats (KmsElement *obj, gchar *selector)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (obj);
+   GstStructure *stats, *rtc_stats, *e_stats, *l_stats;
+ 
+   /* chain up */
+-  stats =
+-      KMS_ELEMENT_CLASS (kms_base_rtp_endpoint_parent_class)->stats (obj,
+-      selector);
++  stats = KMS_ELEMENT_CLASS (kms_base_rtp_endpoint_parent_class)
++              ->stats (obj, selector);
+ 
+   rtc_stats = gst_structure_new_empty (KMS_RTP_STRUCT_NAME);
+   kms_base_rtp_endpoint_add_rtp_stats (self, rtc_stats, selector);
+@@ -2795,21 +2993,21 @@ kms_base_rtp_endpoint_stats (KmsElement * obj, gchar * selector)
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_enable_media_stats (KmsStatsProbe * probe,
+-    KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_enable_media_stats (KmsStatsProbe *probe,
++    KmsBaseRtpEndpoint *self)
+ {
+   kms_stats_probe_latency_meta_set_valid (probe, TRUE);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_disable_media_stats (KmsStatsProbe * probe,
+-    KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_disable_media_stats (KmsStatsProbe *probe,
++    KmsBaseRtpEndpoint *self)
+ {
+   kms_stats_probe_remove (probe);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_collect_media_stats (KmsElement * obj, gboolean enable)
++kms_base_rtp_endpoint_collect_media_stats (KmsElement *obj, gboolean enable)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (obj);
+   KmsBaseSdpEndpoint *base_endpoint = KMS_BASE_SDP_ENDPOINT (self);
+@@ -2823,24 +3021,24 @@ kms_base_rtp_endpoint_collect_media_stats (KmsElement * obj, gboolean enable)
+ 
+   if (enable) {
+     g_slist_foreach (self->priv->stats.probes,
+-        (GFunc) kms_base_rtp_endpoint_enable_media_stats, self);
++        (GFunc)kms_base_rtp_endpoint_enable_media_stats, self);
+     g_hash_table_foreach (sessions,
+         kms_base_rtp_endpoint_enable_connections_stats, NULL);
+   } else {
+     g_slist_foreach (self->priv->stats.probes,
+-        (GFunc) kms_base_rtp_endpoint_disable_media_stats, self);
++        (GFunc)kms_base_rtp_endpoint_disable_media_stats, self);
+     g_hash_table_foreach (sessions,
+         kms_base_rtp_endpoint_disable_connections_stats, NULL);
+   }
+ 
+   KMS_ELEMENT_UNLOCK (self);
+ 
+-  KMS_ELEMENT_CLASS
+-      (kms_base_rtp_endpoint_parent_class)->collect_media_stats (obj, enable);
++  KMS_ELEMENT_CLASS (kms_base_rtp_endpoint_parent_class)
++      ->collect_media_stats (obj, enable);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_constructed (GObject * gobject)
++kms_base_rtp_endpoint_constructed (GObject *gobject)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (gobject);
+ 
+@@ -2848,13 +3046,13 @@ kms_base_rtp_endpoint_constructed (GObject * gobject)
+   gchar *audio_name = g_strconcat (self_name, "_audio", NULL);
+   gchar *video_name = g_strconcat (self_name, "_video", NULL);
+ 
+-  g_free(video_name);
+-  g_free(audio_name);
+-  g_free(self_name);
++  g_free (video_name);
++  g_free (audio_name);
++  g_free (self_name);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
++kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass *klass)
+ {
+   KmsBaseSdpEndpointClass *base_endpoint_class;
+   GstElementClass *gstelement_class;
+@@ -2874,10 +3072,8 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
+       GST_DEBUG_FUNCPTR (kms_base_rtp_endpoint_collect_media_stats);
+ 
+   gstelement_class = GST_ELEMENT_CLASS (klass);
+-  gst_element_class_set_details_simple (gstelement_class,
+-      "BaseRtpEndpoint",
+-      "Base/Bin/BaseRtpEndpoints",
+-      "Base class for RtpEndpoints",
++  gst_element_class_set_details_simple (gstelement_class, "BaseRtpEndpoint",
++      "Base/Bin/BaseRtpEndpoints", "Base class for RtpEndpoints",
+       "José Antonio Santos Cadenas <santoscadenas@kurento.com>");
+ 
+   GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, PLUGIN_NAME, 0, PLUGIN_NAME);
+@@ -2910,19 +3106,16 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
+           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_RTCP_MUX,
+-      g_param_spec_boolean ("rtcp-mux", "RTCP mux",
+-          "RTCP mux", DEFAULT_RTCP_MUX,
+-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++      g_param_spec_boolean ("rtcp-mux", "RTCP mux", "RTCP mux",
++          DEFAULT_RTCP_MUX, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_RTCP_NACK,
+-      g_param_spec_boolean ("rtcp-nack", "RTCP NACK",
+-          "RTCP NACK", DEFAULT_RTCP_NACK,
+-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++      g_param_spec_boolean ("rtcp-nack", "RTCP NACK", "RTCP NACK",
++          DEFAULT_RTCP_NACK, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_RTCP_REMB,
+-      g_param_spec_boolean ("rtcp-remb", "RTCP REMB",
+-          "RTCP REMB", DEFAULT_RTCP_REMB,
+-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++      g_param_spec_boolean ("rtcp-remb", "RTCP REMB", "RTCP REMB",
++          DEFAULT_RTCP_REMB, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_MIN_VIDEO_RECV_BW,
+       g_param_spec_uint ("min-video-recv-bandwidth",
+@@ -2947,29 +3140,23 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
+ 
+   g_object_class_install_property (object_class, PROP_REMB_PARAMS,
+       g_param_spec_boxed ("remb-params", "remb params",
+-          "Set parameters for REMB algorithm",
+-          GST_TYPE_STRUCTURE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++          "Set parameters for REMB algorithm", GST_TYPE_STRUCTURE,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_MIN_PORT,
+-      g_param_spec_uint ("min-port",
+-          "Minimum port number to be used",
+-          "Minimum port number to be used",
+-          0, 65535, DEFAULT_MIN_PORT,
++      g_param_spec_uint ("min-port", "Minimum port number to be used",
++          "Minimum port number to be used", 0, 65535, DEFAULT_MIN_PORT,
+           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_MAX_PORT,
+-      g_param_spec_uint ("max-port",
+-          "Maximum port number to be used",
+-          "Maximum port number to be used",
+-          0, 65535, DEFAULT_MAX_PORT,
++      g_param_spec_uint ("max-port", "Maximum port number to be used",
++          "Maximum port number to be used", 0, 65535, DEFAULT_MAX_PORT,
+           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_MTU,
+-      g_param_spec_uint ("mtu",
+-          "RTP MTU",
+-          "Maximum Transmission Unit (MTU) used for RTP",
+-          0, G_MAXUINT, DEFAULT_MTU,
+-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++      g_param_spec_uint ("mtu", "RTP MTU",
++          "Maximum Transmission Unit (MTU) used for RTP", 0, G_MAXUINT,
++          DEFAULT_MTU, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+ 
+   g_object_class_install_property (object_class, PROP_SUPPORT_FEC,
+       g_param_spec_boolean ("support-fec", "Forward error correction supported",
+@@ -2977,52 +3164,54 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
+           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+ 
+   /* set signals */
+-  obj_signals[GET_CONNECTION_STATE] =
+-      g_signal_new ("get-connection_state",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_ACTION | G_SIGNAL_RUN_LAST,
++  obj_signals[GET_CONNECTION_STATE] = g_signal_new ("get-connection_state",
++      G_TYPE_FROM_CLASS (klass), G_SIGNAL_ACTION | G_SIGNAL_RUN_LAST,
+       G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, get_connection_state), NULL,
+       NULL, __kms_core_marshal_ENUM__STRING, KMS_TYPE_CONNECTION_STATE, 1,
+       G_TYPE_STRING);
+ 
+-  obj_signals[CONNECTION_STATE_CHANGED] =
+-      g_signal_new ("connection-state-changed",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_RUN_LAST,
++  obj_signals[CONNECTION_STATE_CHANGED] = g_signal_new (
++      "connection-state-changed", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+       G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, connection_state_changed), NULL,
+       NULL, __kms_core_marshal_VOID__STRING_ENUM, G_TYPE_NONE, 2, G_TYPE_STRING,
+       KMS_TYPE_CONNECTION_STATE);
+ 
+-  obj_signals[MEDIA_STATE_CHANGED] =
+-      g_signal_new ("media-state-changed",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_RUN_LAST,
++  obj_signals[MEDIA_STATE_CHANGED] = g_signal_new ("media-state-changed",
++      G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+       G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, media_state_changed), NULL,
+       NULL, g_cclosure_marshal_VOID__ENUM, G_TYPE_NONE, 1,
+       KMS_TYPE_MEDIA_STATE);
+ 
+   obj_signals[MEDIA_START] =
+-      g_signal_new ("media-start",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_RUN_LAST,
+-      G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, media_start), NULL, NULL,
+-      __kms_core_marshal_VOID__ENUM_BOOLEAN, G_TYPE_NONE, 2,
+-      KMS_TYPE_MEDIA_TYPE, G_TYPE_BOOLEAN);
++      g_signal_new ("media-start", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++          G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, media_start), NULL, NULL,
++          __kms_core_marshal_VOID__ENUM_BOOLEAN, G_TYPE_NONE, 2,
++          KMS_TYPE_MEDIA_TYPE, G_TYPE_BOOLEAN);
+ 
+   obj_signals[MEDIA_STOP] =
+-      g_signal_new ("media-stop",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_RUN_LAST,
+-      G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, media_stop), NULL, NULL,
+-      __kms_core_marshal_VOID__ENUM_BOOLEAN, G_TYPE_NONE, 2,
+-      KMS_TYPE_MEDIA_TYPE, G_TYPE_BOOLEAN);
++      g_signal_new ("media-stop", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++          G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, media_stop), NULL, NULL,
++          __kms_core_marshal_VOID__ENUM_BOOLEAN, G_TYPE_NONE, 2,
++          KMS_TYPE_MEDIA_TYPE, G_TYPE_BOOLEAN);
+ 
+   obj_signals[SIGNAL_REQUEST_LOCAL_KEY_FRAME] =
+-      g_signal_new ("request-local-key-frame",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_ACTION | G_SIGNAL_RUN_LAST,
+-      G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, request_local_key_frame), NULL,
+-      NULL, __kms_core_marshal_BOOLEAN__VOID, G_TYPE_BOOLEAN, 0);
++      g_signal_new ("request-local-key-frame", G_TYPE_FROM_CLASS (klass),
++          G_SIGNAL_ACTION | G_SIGNAL_RUN_LAST,
++          G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, request_local_key_frame),
++          NULL, NULL, __kms_core_marshal_BOOLEAN__VOID, G_TYPE_BOOLEAN, 0);
++
++  obj_signals[DTMF_EVENT_DETECTED] = g_signal_new ("dtmf-event-detected",
++      G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++      G_STRUCT_OFFSET (KmsBaseRtpEndpointClass,
++          dtmf_event_detected), // No class offset
++      NULL, NULL,
++      __kms_core_marshal_VOID__INT_BOOLEAN_INT_INT_STRING, // Custom marshaller
++      G_TYPE_NONE, 5,
++      G_TYPE_INT, // number
++      G_TYPE_BOOLEAN, // end
++      G_TYPE_INT, // volume
++      G_TYPE_INT, // duration
++      G_TYPE_STRING); // media_type
+ 
+   g_type_class_add_private (klass, sizeof (KmsBaseRtpEndpointPrivate));
+ 
+@@ -3030,37 +3219,40 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass * klass)
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_new_ssrc (GstElement * rtpbin, guint session,
+-    guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_new_ssrc (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+ 
+   KMS_ELEMENT_LOCK (self);
+ 
+   switch (session) {
+-    case AUDIO_RTP_SESSION:
+-      if (self->priv->audio_config->ssrc != 0) {
+-        break;
+-      }
+-
+-      self->priv->audio_config->ssrc = ssrc;
++  case AUDIO_RTP_SESSION:
++    if (self->priv->audio_config->ssrc != 0) {
+       break;
+-    case VIDEO_RTP_SESSION:
+-      if (self->priv->video_config->ssrc != 0) {
+-        break;
+-      }
++    }
+ 
+-      self->priv->video_config->ssrc = ssrc;
++    self->priv->audio_config->ssrc = ssrc;
++    break;
++  case VIDEO_RTP_SESSION:
++    if (self->priv->video_config->ssrc != 0) {
+       break;
+-    default:
+-      GST_WARNING_OBJECT (self, "No media supported for session %u", session);
++    }
++
++    self->priv->video_config->ssrc = ssrc;
++    break;
++  default:
++    GST_WARNING_OBJECT (self, "No media supported for session %u", session);
+   }
+ 
+   KMS_ELEMENT_UNLOCK (self);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_set_media_state (KmsBaseRtpEndpoint * self, guint session,
++kms_base_rtp_endpoint_set_media_state (KmsBaseRtpEndpoint *self,
++    guint session,
+     KmsMediaState state)
+ {
+   gboolean actived = FALSE, emit = FALSE;
+@@ -3071,14 +3263,14 @@ kms_base_rtp_endpoint_set_media_state (KmsBaseRtpEndpoint * self, guint session,
+   actived = state == KMS_MEDIA_STATE_CONNECTED;
+ 
+   switch (session) {
+-    case AUDIO_RTP_SESSION:
+-      self->priv->audio_config->actived = actived;
+-      break;
+-    case VIDEO_RTP_SESSION:
+-      self->priv->video_config->actived = actived;
+-      break;
+-    default:
+-      GST_WARNING_OBJECT (self, "No media supported for session %u", session);
++  case AUDIO_RTP_SESSION:
++    self->priv->audio_config->actived = actived;
++    break;
++  case VIDEO_RTP_SESSION:
++    self->priv->video_config->actived = actived;
++    break;
++  default:
++    GST_WARNING_OBJECT (self, "No media supported for session %u", session);
+   }
+ 
+   if (self->priv->audio_config->actived || self->priv->video_config->actived) {
+@@ -3103,8 +3295,10 @@ kms_base_rtp_endpoint_set_media_state (KmsBaseRtpEndpoint * self, guint session,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_bye_ssrc (GstElement * rtpbin, guint session,
+-    guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_bye_ssrc (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+ 
+@@ -3115,8 +3309,10 @@ kms_base_rtp_endpoint_rtpbin_on_bye_ssrc (GstElement * rtpbin, guint session,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_bye_timeout (GstElement * rtpbin,
+-    guint session, guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_bye_timeout (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+ 
+@@ -3127,8 +3323,10 @@ kms_base_rtp_endpoint_rtpbin_on_bye_timeout (GstElement * rtpbin,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_ssrc_sdes (GstElement * rtpbin, guint session,
+-    guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_ssrc_sdes (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+   KmsMediaType media;
+@@ -3145,23 +3343,25 @@ kms_base_rtp_endpoint_rtpbin_on_ssrc_sdes (GstElement * rtpbin, guint session,
+   KMS_ELEMENT_UNLOCK (self);
+ 
+   switch (session) {
+-    case AUDIO_RTP_SESSION:
+-      media = KMS_MEDIA_TYPE_AUDIO;
+-      break;
+-    case VIDEO_RTP_SESSION:
+-      media = KMS_MEDIA_TYPE_VIDEO;
+-      break;
+-    default:
+-      GST_WARNING_OBJECT (self, "No media supported for session %u", session);
+-      return;
++  case AUDIO_RTP_SESSION:
++    media = KMS_MEDIA_TYPE_AUDIO;
++    break;
++  case VIDEO_RTP_SESSION:
++    media = KMS_MEDIA_TYPE_VIDEO;
++    break;
++  default:
++    GST_WARNING_OBJECT (self, "No media supported for session %u", session);
++    return;
+   }
+ 
+   g_signal_emit (G_OBJECT (self), obj_signals[MEDIA_START], 0, media, FALSE);
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_timeout (GstElement * rtpbin,
+-    guint session, guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_timeout (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+ 
+@@ -3170,8 +3370,10 @@ kms_base_rtp_endpoint_rtpbin_on_timeout (GstElement * rtpbin,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_rtpbin_on_ssrc_active (GstElement * rtpbin,
+-    guint session, guint ssrc, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_on_ssrc_active (GstElement *rtpbin,
++    guint session,
++    guint ssrc,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+ 
+@@ -3180,8 +3382,9 @@ kms_base_rtp_endpoint_rtpbin_on_ssrc_active (GstElement * rtpbin,
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_create_aux_element (KmsBaseRtpEndpoint * self,
+-    guint session, GSList * elements)
++kms_base_rtp_endpoint_create_aux_element (KmsBaseRtpEndpoint *self,
++    guint session,
++    GSList *elements)
+ {
+   GstElement *aux, *input, *output, *prev;
+   GstPad *pad, *target_pad;
+@@ -3229,8 +3432,9 @@ kms_base_rtp_endpoint_create_aux_element (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_create_aux_receiver (KmsBaseRtpEndpoint * self,
+-    guint session, ExtData * edata)
++kms_base_rtp_endpoint_create_aux_receiver (KmsBaseRtpEndpoint *self,
++    guint session,
++    ExtData *edata)
+ {
+   GSList *list = NULL;
+   GstElement *e = NULL;
+@@ -3261,8 +3465,9 @@ kms_base_rtp_endpoint_create_aux_receiver (KmsBaseRtpEndpoint * self,
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_rtpbin_request_aux_receiver (GstElement * rtpbin,
+-    guint session, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_request_aux_receiver (GstElement *rtpbin,
++    guint session,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+   GstElement *receiver = NULL;
+@@ -3294,8 +3499,9 @@ kms_base_rtp_endpoint_rtpbin_request_aux_receiver (GstElement * rtpbin,
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_create_aux_sender (KmsBaseRtpEndpoint * self,
+-    guint session, ExtData * edata)
++kms_base_rtp_endpoint_create_aux_sender (KmsBaseRtpEndpoint *self,
++    guint session,
++    ExtData *edata)
+ {
+   GSList *list = NULL;
+   GstElement *e;
+@@ -3319,7 +3525,7 @@ kms_base_rtp_endpoint_create_aux_sender (KmsBaseRtpEndpoint * self,
+     e = gst_element_factory_make ("ulpfecenc", NULL);
+     /* FIXME: Chrome does not seem to work well with FEC packages generated */
+     /* in our side. Uncomment this when this issue is fixed.                */
+-//    g_object_set (e, "pt", edata->ulpfec_pt, NULL);
++    //    g_object_set (e, "pt", edata->ulpfec_pt, NULL);
+     list = g_slist_prepend (list, e);
+   }
+ 
+@@ -3332,8 +3538,9 @@ end:
+ }
+ 
+ static GstElement *
+-kms_base_rtp_endpoint_rtpbin_request_aux_sender (GstElement * rtpbin,
+-    guint session, gpointer user_data)
++kms_base_rtp_endpoint_rtpbin_request_aux_sender (GstElement *rtpbin,
++    guint session,
++    gpointer user_data)
+ {
+   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+   GstElement *sender = NULL;
+@@ -3361,13 +3568,13 @@ kms_base_rtp_endpoint_rtpbin_request_aux_sender (GstElement * rtpbin,
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_init_stats (KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_init_stats (KmsBaseRtpEndpoint *self)
+ {
+   self->priv->stats.enabled = FALSE;
+   self->priv->stats.rtp_stats = g_hash_table_new_full (g_direct_hash,
+-      g_direct_equal, NULL, (GDestroyNotify) rtp_session_stats_destroy);
++      g_direct_equal, NULL, (GDestroyNotify)rtp_session_stats_destroy);
+   self->priv->stats.avg_e2e = g_hash_table_new_full (g_str_hash, g_str_equal,
+-      g_free, (GDestroyNotify) kms_ref_struct_unref);
++      g_free, (GDestroyNotify)kms_ref_struct_unref);
+ }
+ 
+ static gboolean
+@@ -3386,14 +3593,14 @@ is_fec_supported ()
+ }
+ 
+ static void
+-kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint * self)
++kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint *self)
+ {
+   self->priv = KMS_BASE_RTP_ENDPOINT_GET_PRIVATE (self);
+ 
+   self->priv->support_fec = is_fec_supported ();
+ 
+   self->priv->prot_medias = kms_list_new_full (g_str_equal, g_free,
+-      (GDestroyNotify) kms_ref_struct_unref);
++      (GDestroyNotify)kms_ref_struct_unref);
+ 
+   self->priv->rtcp_mux = DEFAULT_RTCP_MUX;
+   self->priv->rtcp_nack = DEFAULT_RTCP_NACK;
+@@ -3466,16 +3673,14 @@ kms_base_rtp_endpoint_get_internal_session (KmsBaseRtpEndpoint *self,
+   g_signal_emit_by_name (rtpbin, "get-internal-session", session_id,
+       &rtpsession);
+   if (rtpsession == NULL) {
+-    GST_WARNING_OBJECT (self, "GstRtpBin: No RTP session, id: %u",
+-        session_id);
++    GST_WARNING_OBJECT (self, "GstRtpBin: No RTP session, id: %u", session_id);
+   }
+ 
+   return rtpsession;
+ }
+ 
+ static void
+-kms_i_rtp_session_manager_interface_init (KmsIRtpSessionManagerInterface *
+-    iface)
++kms_i_rtp_session_manager_interface_init (KmsIRtpSessionManagerInterface *iface)
+ {
+   iface->request_rtp_sink = kms_base_rtp_endpoint_request_rtp_sink;
+   iface->request_rtp_src = kms_base_rtp_endpoint_request_rtp_src;
+diff --git a/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.h b/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.h
+index a94068df1..fb2ee8db1 100644
+--- a/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.h
++++ b/server/module-core/src/gst-plugins/commons/kmsbasertpendpoint.h
+@@ -25,17 +25,18 @@
+ 
+ G_BEGIN_DECLS
+ /* #defines don't like whitespacey bits */
+-#define KMS_TYPE_BASE_RTP_ENDPOINT \
+-  (kms_base_rtp_endpoint_get_type())
++#define KMS_TYPE_BASE_RTP_ENDPOINT (kms_base_rtp_endpoint_get_type ())
+ #define KMS_BASE_RTP_ENDPOINT(obj) \
+-  (G_TYPE_CHECK_INSTANCE_CAST((obj),KMS_TYPE_BASE_RTP_ENDPOINT,KmsBaseRtpEndpoint))
++  (G_TYPE_CHECK_INSTANCE_CAST ((obj), KMS_TYPE_BASE_RTP_ENDPOINT, \
++      KmsBaseRtpEndpoint))
+ #define KMS_BASE_RTP_ENDPOINT_CLASS(klass) \
+-  (G_TYPE_CHECK_CLASS_CAST((klass),KMS_TYPE_BASE_RTP_ENDPOINT,KmsBaseRtpEndpointClass))
++  (G_TYPE_CHECK_CLASS_CAST ((klass), KMS_TYPE_BASE_RTP_ENDPOINT, \
++      KmsBaseRtpEndpointClass))
+ #define KMS_IS_BASE_RTP_ENDPOINT(obj) \
+-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),KMS_TYPE_BASE_RTP_ENDPOINT))
++  (G_TYPE_CHECK_INSTANCE_TYPE ((obj), KMS_TYPE_BASE_RTP_ENDPOINT))
+ #define KMS_IS_BASE_RTP_ENDPOINT_CLASS(klass) \
+-  (G_TYPE_CHECK_CLASS_TYPE((klass),KMS_TYPE_BASE_RTP_ENDPOINT))
+-#define KMS_BASE_RTP_ENDPOINT_CAST(obj) ((KmsBaseRtpEndpoint*)(obj))
++  (G_TYPE_CHECK_CLASS_TYPE ((klass), KMS_TYPE_BASE_RTP_ENDPOINT))
++#define KMS_BASE_RTP_ENDPOINT_CAST(obj) ((KmsBaseRtpEndpoint *)(obj))
+ 
+ typedef struct _KmsBaseRtpEndpoint KmsBaseRtpEndpoint;
+ typedef struct _KmsBaseRtpEndpointClass KmsBaseRtpEndpointClass;
+@@ -46,32 +47,42 @@ typedef struct _KmsBaseRtpEndpointPrivate KmsBaseRtpEndpointPrivate;
+ #define KMS_BASE_RTP_ENDPOINT_UNLOCK(elem) \
+   (g_rec_mutex_unlock (&KMS_BASE_RTP_ENDPOINT_CAST ((elem))->media_mutex))
+ 
+-
+-struct _KmsBaseRtpEndpoint
+-{
++struct _KmsBaseRtpEndpoint {
+   KmsBaseSdpEndpoint parent;
+ 
+   KmsBaseRtpEndpointPrivate *priv;
+ };
+ 
+-struct _KmsBaseRtpEndpointClass
+-{
++struct _KmsBaseRtpEndpointClass {
+   KmsBaseSdpEndpointClass parent_class;
+ 
+-  void (*media_start) (KmsBaseRtpEndpoint * self, KmsMediaType type,
+-    gboolean local);
+-  void (*media_stop) (KmsBaseRtpEndpoint * self, KmsMediaType type,
+-    gboolean local);
+-  void (*media_state_changed) (KmsBaseRtpEndpoint * self, KmsMediaState new_state);
++  void (*media_start) (KmsBaseRtpEndpoint *self,
++      KmsMediaType type,
++      gboolean local);
++  void (*media_stop) (KmsBaseRtpEndpoint *self,
++      KmsMediaType type,
++      gboolean local);
++  void (
++      *media_state_changed) (KmsBaseRtpEndpoint *self, KmsMediaState new_state);
++
++  KmsConnectionState (
++      *get_connection_state) (KmsBaseRtpEndpoint *self, const gchar *sess_id);
++  void (*connection_state_changed) (KmsBaseRtpEndpoint *self,
++      KmsConnectionState new_state);
+ 
+-  KmsConnectionState (*get_connection_state) (KmsBaseRtpEndpoint * self, const gchar * sess_id);
+-  void (*connection_state_changed) (KmsBaseRtpEndpoint * self, KmsConnectionState new_state);
++  gboolean (*request_local_key_frame) (KmsBaseRtpEndpoint *self);
+ 
+-  gboolean (*request_local_key_frame) (KmsBaseRtpEndpoint * self);
++  void (*dtmf_event_detected) (KmsBaseRtpEndpoint *self,
++      gint number,
++      gboolean end,
++      gint volume,
++      gint duration,
++      const gchar *media_type);
+ };
+ 
+ GType kms_base_rtp_endpoint_get_type (void);
+-GObject *kms_base_rtp_endpoint_get_internal_session (KmsBaseRtpEndpoint *self, guint session_id);
++GObject *kms_base_rtp_endpoint_get_internal_session (KmsBaseRtpEndpoint *self,
++    guint session_id);
+ 
+ G_END_DECLS
+ #endif /* __KMS_BASE_RTP_ENDPOINT_H__ */
+diff --git a/server/module-core/src/gst-plugins/commons/kmsbasertpsession.c b/server/module-core/src/gst-plugins/commons/kmsbasertpsession.c
+index 284b97bb8..d835bcbef 100644
+--- a/server/module-core/src/gst-plugins/commons/kmsbasertpsession.c
++++ b/server/module-core/src/gst-plugins/commons/kmsbasertpsession.c
+@@ -16,7 +16,7 @@
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+-#  include <config.h>
++#include <config.h>
+ #endif
+ 
+ #include "kmsbasertpsession.h"
+@@ -40,40 +40,32 @@ G_DEFINE_QUARK (BUNDLE_CONN_ADDED, bundle_conn_added);
+ #define RTCP_DEMUX_PEER "rtcp-demux-peer"
+ G_DEFINE_QUARK (RTCP_DEMUX_PEER, rtcp_demux_peer);
+ 
+-struct _KmsBaseRTPSessionStats
+-{
++struct _KmsBaseRTPSessionStats {
+   gboolean enabled;
+   gdouble vi;
+   gdouble ai;
+ };
+ 
+-enum
+-{
+-  CONNECTION_STATE_CHANGED,
+-  LAST_SIGNAL
+-};
++enum { CONNECTION_STATE_CHANGED, DTMF_EVENT_DETECTED, LAST_SIGNAL };
+ 
+-static guint obj_signals[LAST_SIGNAL] = { 0 };
++static guint obj_signals[LAST_SIGNAL] = {0};
+ 
+ #define DEFAULT_CONNECTION_STATE KMS_CONNECTION_STATE_DISCONNECTED
+ 
+-enum
+-{
+-  PROP_0,
+-  PROP_CONNECTION_STATE
+-};
++enum { PROP_0, PROP_CONNECTION_STATE };
+ 
+ KmsBaseRtpSession *
+-kms_base_rtp_session_new (KmsBaseSdpEndpoint * ep, guint id,
+-    KmsIRtpSessionManager * manager)
++kms_base_rtp_session_new (KmsBaseSdpEndpoint *ep,
++    guint id,
++    KmsIRtpSessionManager *manager)
+ {
+   GObject *obj;
+   KmsBaseRtpSession *self;
+ 
+   obj = g_object_new (KMS_TYPE_BASE_RTP_SESSION, NULL);
+   self = KMS_BASE_RTP_SESSION (obj);
+-  KMS_BASE_RTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self))->post_constructor
+-      (self, ep, id, manager);
++  KMS_BASE_RTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self))
++      ->post_constructor (self, ep, id, manager);
+ 
+   return self;
+ }
+@@ -81,8 +73,8 @@ kms_base_rtp_session_new (KmsBaseSdpEndpoint * ep, guint id,
+ /* Connection management begin */
+ 
+ KmsIRtpConnection *
+-kms_base_rtp_session_get_connection_by_name (KmsBaseRtpSession * self,
+-    const gchar * name)
++kms_base_rtp_session_get_connection_by_name (KmsBaseRtpSession *self,
++    const gchar *name)
+ {
+   gpointer *conn;
+ 
+@@ -95,8 +87,9 @@ kms_base_rtp_session_get_connection_by_name (KmsBaseRtpSession * self,
+ }
+ 
+ static gchar *
+-kms_base_rtp_session_create_connection_name_from_handler (KmsBaseRtpSession *
+-    self, KmsSdpMediaHandler * handler)
++kms_base_rtp_session_create_connection_name_from_handler (
++    KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler)
+ {
+   gchar *conn_name = NULL;
+   gint gid, hid;
+@@ -119,11 +112,11 @@ kms_base_rtp_session_create_connection_name_from_handler (KmsBaseRtpSession *
+ }
+ 
+ KmsIRtpConnection *
+-kms_base_rtp_session_get_connection (KmsBaseRtpSession * self,
+-    KmsSdpMediaHandler * handler)
++kms_base_rtp_session_get_connection (KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler)
+ {
+-  gchar *name = kms_base_rtp_session_create_connection_name_from_handler (self,
+-      handler);
++  gchar *name =
++      kms_base_rtp_session_create_connection_name_from_handler (self, handler);
+   KmsIRtpConnection *conn;
+ 
+   conn = kms_base_rtp_session_get_connection_by_name (self, name);
+@@ -138,15 +131,17 @@ kms_base_rtp_session_get_connection (KmsBaseRtpSession * self,
+ }
+ 
+ static KmsIRtpConnection *
+-kms_base_rtp_session_create_connection_default (KmsBaseRtpSession * self,
+-    const GstSDPMedia * media, const gchar * name,
+-    guint16 min_port, guint16 max_port)
++kms_base_rtp_session_create_connection_default (KmsBaseRtpSession *self,
++    const GstSDPMedia *media,
++    const gchar *name,
++    guint16 min_port,
++    guint16 max_port)
+ {
+   KmsBaseRtpSessionClass *klass =
+       KMS_BASE_RTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self));
+ 
+-  if (klass->create_connection ==
+-      kms_base_rtp_session_create_connection_default) {
++  if (klass->create_connection
++      == kms_base_rtp_session_create_connection_default) {
+     GST_WARNING_OBJECT (self, "%s does not reimplement 'create_connection'",
+         G_OBJECT_CLASS_NAME (klass));
+   }
+@@ -155,14 +150,17 @@ kms_base_rtp_session_create_connection_default (KmsBaseRtpSession * self,
+ }
+ 
+ static KmsIRtcpMuxConnection *
+-kms_base_rtp_session_create_rtcp_mux_connection_default (KmsBaseRtpSession *
+-    self, const gchar * name, guint16 min_port, guint16 max_port)
++kms_base_rtp_session_create_rtcp_mux_connection_default (
++    KmsBaseRtpSession *self,
++    const gchar *name,
++    guint16 min_port,
++    guint16 max_port)
+ {
+   KmsBaseRtpSessionClass *klass =
+       KMS_BASE_RTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self));
+ 
+-  if (klass->create_rtcp_mux_connection ==
+-      kms_base_rtp_session_create_rtcp_mux_connection_default) {
++  if (klass->create_rtcp_mux_connection
++      == kms_base_rtp_session_create_rtcp_mux_connection_default) {
+     GST_WARNING_OBJECT (self,
+         "%s does not reimplement 'create_rtcp_mux_connection'",
+         G_OBJECT_CLASS_NAME (klass));
+@@ -172,14 +170,16 @@ kms_base_rtp_session_create_rtcp_mux_connection_default (KmsBaseRtpSession *
+ }
+ 
+ static KmsIBundleConnection *
+-kms_base_rtp_session_create_bundle_connection_default (KmsBaseRtpSession *
+-    self, const gchar * name, guint16 min_port, guint16 max_port)
++kms_base_rtp_session_create_bundle_connection_default (KmsBaseRtpSession *self,
++    const gchar *name,
++    guint16 min_port,
++    guint16 max_port)
+ {
+   KmsBaseRtpSessionClass *klass =
+       KMS_BASE_RTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self));
+ 
+-  if (klass->create_bundle_connection ==
+-      kms_base_rtp_session_create_bundle_connection_default) {
++  if (klass->create_bundle_connection
++      == kms_base_rtp_session_create_bundle_connection_default) {
+     GST_WARNING_OBJECT (self,
+         "%s does not reimplement 'create_bundle_connection'",
+         G_OBJECT_CLASS_NAME (klass));
+@@ -189,8 +189,11 @@ kms_base_rtp_session_create_bundle_connection_default (KmsBaseRtpSession *
+ }
+ 
+ static void
+-kms_base_rtp_session_e2e_latency_cb (GstPad * pad, KmsMediaType type,
+-    GstClockTimeDiff t, KmsList * mdata, gpointer user_data)
++kms_base_rtp_session_e2e_latency_cb (GstPad *pad,
++    KmsMediaType type,
++    GstClockTimeDiff t,
++    KmsList *mdata,
++    gpointer user_data)
+ {
+   KmsBaseRtpSession *self = KMS_BASE_RTP_SESSION (user_data);
+   KmsListIter iter;
+@@ -201,7 +204,7 @@ kms_base_rtp_session_e2e_latency_cb (GstPad * pad, KmsMediaType type,
+ 
+   kms_list_iter_init (&iter, mdata);
+   while (kms_list_iter_next (&iter, &key, &value)) {
+-    gchar *id = (gchar *) key;
++    gchar *id = (gchar *)key;
+     StreamE2EAvgStat *stat;
+ 
+     if (!g_str_has_prefix (id, name)) {
+@@ -209,7 +212,7 @@ kms_base_rtp_session_e2e_latency_cb (GstPad * pad, KmsMediaType type,
+       continue;
+     }
+ 
+-    stat = (StreamE2EAvgStat *) value;
++    stat = (StreamE2EAvgStat *)value;
+     stat->avg = KMS_STATS_CALCULATE_LATENCY_AVG (t, stat->avg);
+   }
+ 
+@@ -217,8 +220,8 @@ kms_base_rtp_session_e2e_latency_cb (GstPad * pad, KmsMediaType type,
+ }
+ 
+ static void
+-kms_base_rtp_session_set_connection_stats (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn)
++kms_base_rtp_session_set_connection_stats (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn)
+ {
+   kms_i_rtp_connection_set_latency_callback (conn,
+       kms_base_rtp_session_e2e_latency_cb, self);
+@@ -228,8 +231,10 @@ kms_base_rtp_session_set_connection_stats (KmsBaseRtpSession * self,
+ }
+ 
+ KmsIRtpConnection *
+-kms_base_rtp_session_create_connection (KmsBaseRtpSession * self,
+-    KmsSdpMediaHandler * handler, GstSDPMedia * media, guint16 min_port,
++kms_base_rtp_session_create_connection (KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler,
++    GstSDPMedia *media,
++    guint16 min_port,
+     guint16 max_port)
+ {
+   KmsBaseRtpSessionClass *base_rtp_class =
+@@ -249,17 +254,14 @@ kms_base_rtp_session_create_connection (KmsBaseRtpSession * self,
+     goto end;
+   }
+ 
+-  if (g_str_has_prefix (name, BUNDLE_STREAM_NAME)) {    /* bundle */
+-    conn =
+-        KMS_I_RTP_CONNECTION (base_rtp_class->create_bundle_connection (self,
+-            name, min_port, max_port));
++  if (g_str_has_prefix (name, BUNDLE_STREAM_NAME)) { /* bundle */
++    conn = KMS_I_RTP_CONNECTION (base_rtp_class->create_bundle_connection (self,
++        name, min_port, max_port));
+   } else if (gst_sdp_media_get_attribute_val (media, "rtcp-mux") != NULL) {
+-    conn =
+-        KMS_I_RTP_CONNECTION (base_rtp_class->create_rtcp_mux_connection
+-        (self, name, min_port, max_port));
++    conn = KMS_I_RTP_CONNECTION (base_rtp_class->create_rtcp_mux_connection (
++        self, name, min_port, max_port));
+   } else {
+-    conn =
+-        base_rtp_class->create_connection (self, media, name, min_port,
++    conn = base_rtp_class->create_connection (self, media, name, min_port,
+         max_port);
+   }
+ 
+@@ -280,8 +282,9 @@ end:
+ /* Start Transport Send begin */
+ 
+ static gboolean
+-ssrcs_are_mapped (GstElement * ssrcdemux,
+-    guint32 local_ssrc, guint32 remote_ssrc)
++ssrcs_are_mapped (GstElement *ssrcdemux,
++    guint32 local_ssrc,
++    guint32 remote_ssrc)
+ {
+   GstElement *rtcpdemux =
+       g_object_get_qdata (G_OBJECT (ssrcdemux), rtcp_demux_peer_quark ());
+@@ -341,15 +344,17 @@ on_rtcpdemux_new_ssrc_pad (GstElement *rtcpdemux,
+     gst_element_sync_state_with_parent_target_state (fakesink);
+     GstPad *sink = gst_element_get_static_pad (fakesink, "sink");
+     kms_base_rtp_session_link_pads (pad, sink);
+-    gst_object_unref(sink);
++    gst_object_unref (sink);
+   }
+ 
+   KMS_SDP_SESSION_UNLOCK (self);
+ }
+ 
+ static void
+-rtp_ssrc_demux_new_ssrc_pad (GstElement * ssrcdemux, guint ssrc, GstPad * pad,
+-    KmsBaseRtpSession * self)
++rtp_ssrc_demux_new_ssrc_pad (GstElement *ssrcdemux,
++    guint ssrc,
++    GstPad *pad,
++    KmsBaseRtpSession *self)
+ {
+   const gchar *rtp_pad_name = GST_OBJECT_NAME (pad);
+   gchar *rtcp_pad_name;
+@@ -380,7 +385,8 @@ rtp_ssrc_demux_new_ssrc_pad (GstElement * ssrcdemux, guint ssrc, GstPad * pad,
+   }
+ 
+   /* RTP */
+-  sink = kms_i_rtp_session_manager_request_rtp_sink (self->manager, self, media);
++  sink =
++      kms_i_rtp_session_manager_request_rtp_sink (self->manager, self, media);
+   kms_base_rtp_session_link_pads (pad, sink);
+   g_object_unref (sink);
+ 
+@@ -388,7 +394,8 @@ rtp_ssrc_demux_new_ssrc_pad (GstElement * ssrcdemux, guint ssrc, GstPad * pad,
+   rtcp_pad_name = g_strconcat ("rtcp_", rtp_pad_name, NULL);
+   src = gst_element_get_static_pad (ssrcdemux, rtcp_pad_name);
+   g_free (rtcp_pad_name);
+-  sink = kms_i_rtp_session_manager_request_rtcp_sink (self->manager, self, media);
++  sink =
++      kms_i_rtp_session_manager_request_rtcp_sink (self->manager, self, media);
+   kms_base_rtp_session_link_pads (src, sink);
+   g_object_unref (src);
+   g_object_unref (sink);
+@@ -398,16 +405,18 @@ end:
+ }
+ 
+ static void
+-kms_base_rtp_session_add_gst_bundle_elements (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn, const GstSDPMedia * media, gboolean active)
++kms_base_rtp_session_add_gst_bundle_elements (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn,
++    const GstSDPMedia *media,
++    gboolean active)
+ {
+   gboolean added;
+   GstElement *rtcpdemux;
+   GstElement *ssrcdemux;
+   GstPad *src, *sink;
+ 
+-  if (GPOINTER_TO_UINT (g_object_get_qdata (G_OBJECT (conn),
+-              bundle_conn_added_quark ()))) {
++  if (GPOINTER_TO_UINT (
++          g_object_get_qdata (G_OBJECT (conn), bundle_conn_added_quark ()))) {
+     GST_DEBUG_OBJECT (self, "Connection configured");
+     return;
+   }
+@@ -460,8 +469,9 @@ kms_base_rtp_session_add_gst_bundle_elements (KmsBaseRtpSession * self,
+ }
+ 
+ static void
+-kms_base_rtp_session_link_gst_connection_sink (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn, const GstSDPMedia * media)
++kms_base_rtp_session_link_gst_connection_sink (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn,
++    const GstSDPMedia *media)
+ {
+   GstPad *src, *sink;
+ 
+@@ -480,30 +490,482 @@ kms_base_rtp_session_link_gst_connection_sink (KmsBaseRtpSession * self,
+   g_object_unref (sink);
+ }
+ 
++/* ========================================
++ * BUS HANDLER FUNCTIONS
++ * ======================================== */
++
++static GstBusSyncReply
++kms_base_rtp_session_dtmf_bus_handler (GstBus *bus,
++    GstMessage *msg,
++    KmsBaseRtpSession *self)
++{
++  switch (GST_MESSAGE_TYPE (msg)) {
++  case GST_MESSAGE_ELEMENT: {
++    const GstStructure *s = gst_message_get_structure (msg);
++    if (gst_structure_has_name (s, "dtmf-event")) {
++      gint number, volume, duration;
++      gboolean end;
++
++      gst_structure_get_int (s, "number", &number);
++      gst_structure_get_boolean (s, "end", &end);
++      gst_structure_get_int (s, "volume", &volume);
++      gst_structure_get_int (s, "duration", &duration);
++
++      g_print (
++          "[PANKAJ DTMF DETECTED] Number: %d, End: %s, Volume: %d, Duration: %d\n",
++          number, end ? "true" : "false", volume, duration);
++
++      // Emit the DTMF_EVENT_DETECTED signal
++      g_signal_emit (self, obj_signals[DTMF_EVENT_DETECTED], 0, number, end,
++          volume, duration, "audio");
++
++      GST_INFO_OBJECT (self,
++          "DTMF Event: number=%d, end=%s, volume=%d, duration=%d", number,
++          end ? "true" : "false", volume, duration);
++
++    } else {
++      // Let other element messages pass through
++      return GST_BUS_PASS;
++    }
++    break;
++  }
++  default:
++    return GST_BUS_PASS;
++  }
++
++  return GST_BUS_PASS;
++}
++
++/* Combined function to setup DTMF message handling */
++static void
++setup_dtmf_message_handler (KmsBaseRtpSession *self)
++{
++  GstBus *pipeline_bus = gst_element_get_bus (GST_ELEMENT (self));
++  if (!pipeline_bus) {
++    g_print ("Pankaj Failed to get pipeline bus for DTMF handler setup\n");
++    return;
++  }
++
++  /* Set the sync handler to process DTMF events */
++  gst_bus_set_sync_handler (pipeline_bus,
++      (GstBusSyncHandler)kms_base_rtp_session_dtmf_bus_handler, self, NULL);
++
++  gst_object_unref (pipeline_bus);
++  g_print ("Pankaj Set up DTMF message handler\n");
++}
++
++/* ========================================
++ * DTMF DETECTION FUNCTIONS
++ * ======================================== */
++
++// static GstPadProbeReturn
++// dtmf_pad_probe_cb (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
++// {
++//   GstBuffer *buffer;
++//   GstRTPBuffer rtp_buffer = GST_RTP_BUFFER_INIT;
++//   guint8 payload_type;
++
++//   if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
++//     buffer = GST_PAD_PROBE_INFO_BUFFER (info);
++
++//     if (gst_rtp_buffer_map (buffer, GST_MAP_READ, &rtp_buffer)) {
++//       payload_type = gst_rtp_buffer_get_payload_type (&rtp_buffer);
++//       gst_rtp_buffer_unmap (&rtp_buffer);
++
++//       /* Only allow DTMF packets (payload type 101) to pass through */
++//       if (payload_type != 101) {
++//         g_print ("Pankaj Dropping non-DTMF packet with payload type %d\n",
++//             payload_type);
++//         return GST_PAD_PROBE_DROP;
++//       }
++
++//       g_print ("Pankaj Allowing DTMF packet with payload type %d\n",
++//           payload_type);
++//       return GST_PAD_PROBE_OK;
++//     }
++//   }
++
++//   return GST_PAD_PROBE_OK;
++// }
++/* Combined function to setup RTP pipeline with optional DTMF detection */
++// static gboolean
++// setup_rtp_pipeline (KmsBaseRtpSession *self, GstPad *src, GstPad *sink)
++// {
++
++//   /* DTMF-enabled pipeline setup */
++//   GstElement *rtp_tee, *rtp_queue;
++//   GstElement *dtmf_capsfilter, *dtmf_depay, *dtmf_fakesink;
++
++//   /* Create tee element */
++//   rtp_tee = gst_element_factory_make ("tee", "rtp-tee");
++//   if (!rtp_tee) {
++//     g_print ("Pankaj Failed to create RTP tee element\n");
++//     return FALSE;
++//   }
++
++//   /* Create and configure queue element for main branch */
++//   rtp_queue = gst_element_factory_make ("queue", "rtp-queue");
++//   if (!rtp_queue) {
++//     g_print ("Pankaj Failed to create RTP queue element\n");
++//     gst_object_unref (rtp_tee);
++//     return FALSE;
++//   }
++//   /* Set queue properties for better performance */
++//   g_object_set (rtp_queue, "max-size-time", (guint64)200000000, /* 200ms */
++//       "max-size-buffers", 0, /* No buffer limit */
++//       "max-size-bytes", 0, /* No byte limit */
++//       NULL);
++
++//   /* Create DTMF detection elements */
++//   dtmf_capsfilter = gst_element_factory_make ("capsfilter", "dtmf-caps-filter");
++//   dtmf_depay = gst_element_factory_make ("rtpdtmfdepay", "dtmf-depay");
++//   dtmf_fakesink = gst_element_factory_make ("fakesink", "dtmf-fakesink");
++
++//   if (!dtmf_capsfilter || !dtmf_depay || !dtmf_fakesink) {
++//     g_print ("Pankaj Failed to create DTMF detection elements\n");
++//     if (dtmf_capsfilter)
++//       gst_object_unref (dtmf_capsfilter);
++//     if (dtmf_depay)
++//       gst_object_unref (dtmf_depay);
++//     if (dtmf_fakesink)
++//       gst_object_unref (dtmf_fakesink);
++//     gst_object_unref (rtp_tee);
++//     gst_object_unref (rtp_queue);
++//     return FALSE;
++//   }
++
++//   /* Configure DTMF elements */
++//   GstCaps *dtmf_caps = gst_caps_from_string (
++//       "application/x-rtp, encoding-name=(string)TELEPHONE-EVENT, payload=(int)101, "
++//       "media=(string)audio, clock-rate=(int)8000");
++//   g_object_set (G_OBJECT (dtmf_capsfilter), "caps", dtmf_caps, NULL);
++//   gst_caps_unref (dtmf_caps);
++//   g_object_set (dtmf_fakesink, "sync", FALSE, "async", FALSE, NULL);
++
++//   /* Add elements to the pipeline */
++//   gst_bin_add_many (GST_BIN (self), rtp_tee, rtp_queue, dtmf_capsfilter,
++//       dtmf_depay, dtmf_fakesink, NULL);
++//   g_print ("Pankaj Added all elements to pipeline\n");
++
++//   /* Link original source to tee sink */
++//   GstPad *tee_sink_pad = gst_element_get_static_pad (rtp_tee, "sink");
++//   if (gst_pad_link (src, tee_sink_pad) != GST_PAD_LINK_OK) {
++//     g_print ("Pankaj Failed to link src to tee\n");
++//     gst_object_unref (tee_sink_pad);
++//     goto cleanup_elements;
++//   }
++//   gst_object_unref (tee_sink_pad);
++//   g_print ("Pankaj Successfully linked src to tee\n");
++
++//   /* Create first branch - tee to queue (main RTP path) */
++//   GstPad *tee_src_pad1 = gst_element_request_pad_simple (rtp_tee, "src_%u");
++//   GstPad *queue_sink_pad = gst_element_get_static_pad (rtp_queue, "sink");
++//   if (gst_pad_link (tee_src_pad1, queue_sink_pad) != GST_PAD_LINK_OK) {
++//     g_print ("Pankaj Failed to link tee to queue\n");
++//     gst_object_unref (tee_src_pad1);
++//     gst_object_unref (queue_sink_pad);
++//     goto cleanup_elements;
++//   }
++//   gst_object_unref (queue_sink_pad);
++//   g_print ("Pankaj Successfully linked tee to queue\n");
++
++//   /* Link queue to final sink */
++//   GstPad *queue_src_pad = gst_element_get_static_pad (rtp_queue, "src");
++//   kms_base_rtp_session_link_pads (queue_src_pad, sink);
++//   gst_object_unref (queue_src_pad);
++//   gst_object_unref (tee_src_pad1);
++//   g_print ("Pankaj Successfully linked queue to main sink\n");
++
++//   /* Create second branch - tee to DTMF detection pipeline */
++//   GstPad *tee_src_pad2 = gst_element_request_pad_simple (rtp_tee, "src_%u");
++//   GstPad *dtmf_caps_sink_pad =
++//       gst_element_get_static_pad (dtmf_capsfilter, "sink");
++//   if (gst_pad_link (tee_src_pad2, dtmf_caps_sink_pad) != GST_PAD_LINK_OK) {
++//     g_print ("Pankaj Failed to link tee to DTMF caps filter\n");
++//     gst_object_unref (tee_src_pad2);
++//     gst_object_unref (dtmf_caps_sink_pad);
++//     goto cleanup_elements;
++//   }
++//   gst_object_unref (dtmf_caps_sink_pad);
++//   gst_object_unref (tee_src_pad2);
++//   g_print ("Pankaj Successfully linked tee to DTMF caps filter\n");
++
++//   /* Link DTMF detection chain: capsfilter -> dtmfdepay -> fakesink */
++//   if (!gst_element_link_many (dtmf_capsfilter, dtmf_depay, dtmf_fakesink,
++//           NULL)) {
++//     g_print ("Pankaj Failed to link DTMF detection chain\n");
++//     goto cleanup_elements;
++//   }
++//   g_print ("Pankaj Successfully linked DTMF detection chain\n");
++
++//   /* Setup DTMF message handler */
++//   setup_dtmf_message_handler (self);
++
++//   /* Sync all element states with pipeline */
++//   gst_element_sync_state_with_parent (rtp_tee);
++//   gst_element_sync_state_with_parent (rtp_queue);
++//   gst_element_sync_state_with_parent (dtmf_capsfilter);
++//   gst_element_sync_state_with_parent (dtmf_depay);
++//   gst_element_sync_state_with_parent (dtmf_fakesink);
++
++//   g_print ("Pankaj RTP tee with DTMF detection setup completed successfully\n");
++//   g_print (
++//       "Pankaj Pipeline structure: src -> tee -> [queue -> main_sink] + [caps -> dtmfdepay -> fakesink]\n");
++//   return TRUE;
++
++// cleanup_elements:
++//   /* Cleanup on failure */
++//   gst_element_set_state (rtp_tee, GST_STATE_NULL);
++//   gst_element_set_state (rtp_queue, GST_STATE_NULL);
++//   gst_element_set_state (dtmf_capsfilter, GST_STATE_NULL);
++//   gst_element_set_state (dtmf_depay, GST_STATE_NULL);
++//   gst_element_set_state (dtmf_fakesink, GST_STATE_NULL);
++//   gst_bin_remove_many (GST_BIN (self), rtp_tee, rtp_queue, dtmf_capsfilter,
++//       dtmf_depay, dtmf_fakesink, NULL);
++//   return FALSE;
++// }
++
++static gboolean
++setup_rtp_pipeline (KmsBaseRtpSession *self, GstPad *src, GstPad *sink)
++{
++  /* DTMF-enabled pipeline setup */
++  GstElement *rtp_tee, *rtp_queue;
++  GstElement *dtmf_capsfilter, *dtmf_depay, *dtmf_fakesink;
++  GstElement *dtmf_queue; // Add queue for DTMF branch
++
++  /* Create tee element */
++  rtp_tee = gst_element_factory_make ("tee", "rtp-tee");
++  if (!rtp_tee) {
++    g_print ("Pankaj Failed to create RTP tee element\n");
++    return FALSE;
++  }
++
++  /* Create and configure queue element for main branch */
++  rtp_queue = gst_element_factory_make ("queue", "rtp-queue");
++  if (!rtp_queue) {
++    g_print ("Pankaj Failed to create RTP queue element\n");
++    gst_object_unref (rtp_tee);
++    return FALSE;
++  }
++  /* Set queue properties for better performance */
++  g_object_set (rtp_queue, "max-size-time", (guint64)200000000, /* 200ms */
++      "max-size-buffers", 0, /* No buffer limit */
++      "max-size-bytes", 0, /* No byte limit */
++      NULL);
++
++  /* Create DTMF queue for better isolation */
++  dtmf_queue = gst_element_factory_make ("queue", "dtmf-queue");
++  if (!dtmf_queue) {
++    g_print ("Pankaj Failed to create DTMF queue element\n");
++    gst_object_unref (rtp_tee);
++    gst_object_unref (rtp_queue);
++    return FALSE;
++  }
++  /* Configure DTMF queue with smaller buffer */
++  g_object_set (dtmf_queue, "max-size-time", (guint64)100000000, /* 100ms */
++      "max-size-buffers", 50,
++      "max-size-bytes", 0,
++      NULL);
++
++  /* Create DTMF detection elements */
++  dtmf_capsfilter = gst_element_factory_make ("capsfilter", "dtmf-caps-filter");
++  dtmf_depay = gst_element_factory_make ("rtpdtmfdepay", "dtmf-depay");
++  dtmf_fakesink = gst_element_factory_make ("fakesink", "dtmf-fakesink");
++
++  if (!dtmf_capsfilter || !dtmf_depay || !dtmf_fakesink) {
++    g_print ("Pankaj Failed to create DTMF detection elements\n");
++    if (dtmf_capsfilter)
++      gst_object_unref (dtmf_capsfilter);
++    if (dtmf_depay)
++      gst_object_unref (dtmf_depay);
++    if (dtmf_fakesink)
++      gst_object_unref (dtmf_fakesink);
++    gst_object_unref (rtp_tee);
++    gst_object_unref (rtp_queue);
++    gst_object_unref (dtmf_queue);
++    return FALSE;
++  }
++
++  /* Configure DTMF elements with more specific caps */
++  GstCaps *dtmf_caps = gst_caps_from_string (
++      "application/x-rtp, "
++      "encoding-name=(string)TELEPHONE-EVENT, "
++      "payload=(int)101, "
++      "media=(string)audio, "
++      "clock-rate=(int)8000");
++  g_object_set (G_OBJECT (dtmf_capsfilter), "caps", dtmf_caps, NULL);
++  gst_caps_unref (dtmf_caps);
++
++  /* Configure fakesink to be silent and not sync */
++  g_object_set (dtmf_fakesink, 
++      "sync", FALSE, 
++      "async", FALSE,
++      "silent", TRUE,
++      "dump", FALSE,
++      NULL);
++
++  /* Configure rtpdtmfdepay for better validation */
++  g_object_set (dtmf_depay,
++      "drop-redundant", TRUE,  // Drop redundant DTMF packets
++      NULL);
++
++  /* Add elements to the pipeline including the DTMF queue */
++  gst_bin_add_many (GST_BIN (self), rtp_tee, rtp_queue, dtmf_queue, 
++      dtmf_capsfilter, dtmf_depay, dtmf_fakesink, NULL);
++  g_print ("Pankaj Added all elements to pipeline\n");
++
++  /* Link original source to tee sink */
++  GstPad *tee_sink_pad = gst_element_get_static_pad (rtp_tee, "sink");
++  if (gst_pad_link (src, tee_sink_pad) != GST_PAD_LINK_OK) {
++    g_print ("Pankaj Failed to link src to tee\n");
++    gst_object_unref (tee_sink_pad);
++    goto cleanup_elements;
++  }
++  gst_object_unref (tee_sink_pad);
++  g_print ("Pankaj Successfully linked src to tee\n");
++
++  /* Create first branch - tee to queue (main RTP path) */
++  GstPad *tee_src_pad1 = gst_element_request_pad_simple (rtp_tee, "src_%u");
++  GstPad *queue_sink_pad = gst_element_get_static_pad (rtp_queue, "sink");
++  if (gst_pad_link (tee_src_pad1, queue_sink_pad) != GST_PAD_LINK_OK) {
++    g_print ("Pankaj Failed to link tee to queue\n");
++    gst_object_unref (tee_src_pad1);
++    gst_object_unref (queue_sink_pad);
++    goto cleanup_elements;
++  }
++  gst_object_unref (queue_sink_pad);
++  g_print ("Pankaj Successfully linked tee to queue\n");
++
++  /* Link queue to final sink */
++  GstPad *queue_src_pad = gst_element_get_static_pad (rtp_queue, "src");
++  kms_base_rtp_session_link_pads (queue_src_pad, sink);
++  gst_object_unref (queue_src_pad);
++  gst_object_unref (tee_src_pad1);
++  g_print ("Pankaj Successfully linked queue to main sink\n");
++
++  /* Create second branch - tee to DTMF detection pipeline with queue */
++  GstPad *tee_src_pad2 = gst_element_request_pad_simple (rtp_tee, "src_%u");
++  GstPad *dtmf_queue_sink_pad = gst_element_get_static_pad (dtmf_queue, "sink");
++  if (gst_pad_link (tee_src_pad2, dtmf_queue_sink_pad) != GST_PAD_LINK_OK) {
++    g_print ("Pankaj Failed to link tee to DTMF queue\n");
++    gst_object_unref (tee_src_pad2);
++    gst_object_unref (dtmf_queue_sink_pad);
++    goto cleanup_elements;
++  }
++  gst_object_unref (dtmf_queue_sink_pad);
++  gst_object_unref (tee_src_pad2);
++  g_print ("Pankaj Successfully linked tee to DTMF queue\n");
++
++  /* Link DTMF detection chain: queue -> capsfilter -> dtmfdepay -> fakesink */
++  if (!gst_element_link_many (dtmf_queue, dtmf_capsfilter, dtmf_depay, 
++          dtmf_fakesink, NULL)) {
++    g_print ("Pankaj Failed to link DTMF detection chain\n");
++    goto cleanup_elements;
++  }
++  g_print ("Pankaj Successfully linked DTMF detection chain\n");
++
++  /* Setup DTMF message handler */
++  setup_dtmf_message_handler (self);
++
++  /* Sync all element states with pipeline */
++  gst_element_sync_state_with_parent (rtp_tee);
++  gst_element_sync_state_with_parent (rtp_queue);
++  gst_element_sync_state_with_parent (dtmf_queue);
++  gst_element_sync_state_with_parent (dtmf_capsfilter);
++  gst_element_sync_state_with_parent (dtmf_depay);
++  gst_element_sync_state_with_parent (dtmf_fakesink);
++
++  g_print ("Pankaj RTP tee with DTMF detection setup completed successfully\n");
++  g_print (
++      "Pankaj Pipeline structure: src -> tee -> [queue -> main_sink] + [dtmf_queue -> caps -> dtmfdepay -> fakesink]\n");
++  return TRUE;
++
++cleanup_elements:
++  /* Cleanup on failure */
++  gst_element_set_state (rtp_tee, GST_STATE_NULL);
++  gst_element_set_state (rtp_queue, GST_STATE_NULL);
++  gst_element_set_state (dtmf_queue, GST_STATE_NULL);
++  gst_element_set_state (dtmf_capsfilter, GST_STATE_NULL);
++  gst_element_set_state (dtmf_depay, GST_STATE_NULL);
++  gst_element_set_state (dtmf_fakesink, GST_STATE_NULL);
++  gst_bin_remove_many (GST_BIN (self), rtp_tee, rtp_queue, dtmf_queue,
++      dtmf_capsfilter, dtmf_depay, dtmf_fakesink, NULL);
++  return FALSE;
++}
++
++
+ static void
+-kms_base_rtp_session_link_gst_connection_src (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn, const GstSDPMedia * media)
++kms_base_rtp_session_link_gst_connection_src (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn,
++    const GstSDPMedia *media)
+ {
++  gboolean is_dtmf_enabled = TRUE;
++  g_print (
++      "Pankaj kms_base_rtp_session_link_gst_connection_src Linking connection src for media: %s (DTMF: %s)\n",
++      gst_sdp_media_get_media (media),
++      is_dtmf_enabled ? "enabled" : "disabled");
++
+   GstPad *src, *sink;
+ 
+-  /* RTP */
++  /* RTP Setup */
+   src = kms_i_rtp_connection_request_rtp_src (conn);
+-  sink = kms_i_rtp_session_manager_request_rtp_sink (self->manager, self, media);
+-  kms_base_rtp_session_link_pads (src, sink);
++  sink =
++      kms_i_rtp_session_manager_request_rtp_sink (self->manager, self, media);
++
++  g_print ("Pankaj linking src RTP src pad: %s (%s)\n", GST_OBJECT_NAME (src),
++      G_OBJECT_TYPE_NAME (src));
++  g_print ("Pankaj linking src RTP sink pad: %s (%s)\n", GST_OBJECT_NAME (sink),
++      G_OBJECT_TYPE_NAME (sink));
++
++  /* Setup RTP pipeline (with or without DTMF) */
++  if (is_dtmf_enabled) {
++    setup_rtp_pipeline (self, src, sink);
++  } else {
++    kms_base_rtp_session_link_pads (src, sink);
++    g_print ("Pankaj Simple RTP pipeline setup completed (direct link)\n");
++  }
++
++  /* Cleanup RTP pads */
+   g_object_unref (src);
+   g_object_unref (sink);
+ 
+-  /* RTCP */
++  /* RTCP - Keep original implementation */
+   src = kms_i_rtp_connection_request_rtcp_src (conn);
+-  sink = kms_i_rtp_session_manager_request_rtcp_sink (self->manager, self, media);
++  sink =
++      kms_i_rtp_session_manager_request_rtcp_sink (self->manager, self, media);
+   kms_base_rtp_session_link_pads (src, sink);
+   g_object_unref (src);
+   g_object_unref (sink);
++
++  g_print ("Pankaj RTP session linking completed successfully\n");
+ }
+ 
++// static void
++// kms_base_rtp_session_link_gst_connection_src (KmsBaseRtpSession * self,
++//     KmsIRtpConnection * conn, const GstSDPMedia * media)
++// {
++//   GstPad *src, *sink;
++
++//   /* RTP */
++//   src = kms_i_rtp_connection_request_rtp_src (conn);
++//   sink = kms_i_rtp_session_manager_request_rtp_sink (self->manager, self, media);
++//   kms_base_rtp_session_link_pads (src, sink);
++//   g_object_unref (src);
++//   g_object_unref (sink);
++
++//   /* RTCP */
++//   src = kms_i_rtp_connection_request_rtcp_src (conn);
++//   sink = kms_i_rtp_session_manager_request_rtcp_sink (self->manager, self, media);
++//   kms_base_rtp_session_link_pads (src, sink);
++//   g_object_unref (src);
++//   g_object_unref (sink);
++// }
++
+ static void
+-kms_base_rtp_session_add_gst_rtcp_mux_elements (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn, const GstSDPMedia * media, gboolean active)
++kms_base_rtp_session_add_gst_rtcp_mux_elements (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn,
++    const GstSDPMedia *media,
++    gboolean active)
+ {
+   GstPad *src, *sink;
+ 
+@@ -532,8 +994,10 @@ kms_base_rtp_session_add_gst_rtcp_mux_elements (KmsBaseRtpSession * self,
+ }
+ 
+ static void
+-kms_base_rtp_session_add_gst_basic_elements (KmsBaseRtpSession * self,
+-    KmsIRtpConnection * conn, const GstSDPMedia * media, gboolean active)
++kms_base_rtp_session_add_gst_basic_elements (KmsBaseRtpSession *self,
++    KmsIRtpConnection *conn,
++    const GstSDPMedia *media,
++    gboolean active)
+ {
+   kms_i_rtp_connection_add (conn, GST_BIN (self), active);
+   kms_i_rtp_connection_sink_sync_state_with_parent (conn);
+@@ -545,8 +1009,10 @@ kms_base_rtp_session_add_gst_basic_elements (KmsBaseRtpSession * self,
+ }
+ 
+ static gboolean
+-kms_base_rtp_session_add_gst_connection_elements (KmsBaseRtpSession * self,
+-    KmsSdpMediaHandler * handler, const GstSDPMedia * media, gboolean active)
++kms_base_rtp_session_add_gst_connection_elements (KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler,
++    const GstSDPMedia *media,
++    gboolean active)
+ {
+   KmsIRtpConnection *conn;
+   gint hid, gid;
+@@ -563,12 +1029,10 @@ kms_base_rtp_session_add_gst_connection_elements (KmsBaseRtpSession * self,
+     // BUNDLE connection
+     kms_base_rtp_session_add_gst_bundle_elements (self, conn, media, active);
+     kms_base_rtp_session_link_gst_connection_sink (self, conn, media);
+-  }
+-  else if (gst_sdp_media_get_attribute_val (media, "rtcp-mux") != NULL) {
++  } else if (gst_sdp_media_get_attribute_val (media, "rtcp-mux") != NULL) {
+     // Multiplexed RTP & RTCP connection (both go through the same port)
+     kms_base_rtp_session_add_gst_rtcp_mux_elements (self, conn, media, active);
+-  }
+-  else {
++  } else {
+     // Basic connection (typical separated ports for RTP and RTCP)
+     kms_base_rtp_session_add_gst_basic_elements (self, conn, media, active);
+   }
+@@ -577,8 +1041,9 @@ kms_base_rtp_session_add_gst_connection_elements (KmsBaseRtpSession * self,
+ }
+ 
+ static const gchar *
+-kms_base_rtp_session_process_remote_ssrc (KmsBaseRtpSession * self,
+-    const GstSDPMedia * remote_media, const GstSDPMedia * neg_media)
++kms_base_rtp_session_process_remote_ssrc (KmsBaseRtpSession *self,
++    const GstSDPMedia *remote_media,
++    const GstSDPMedia *neg_media)
+ {
+   const gchar *media_str = gst_sdp_media_get_media (remote_media);
+   guint ssrc;
+@@ -592,8 +1057,7 @@ kms_base_rtp_session_process_remote_ssrc (KmsBaseRtpSession * self,
+     if (ssrc != SSRC_INVALID) {
+       GST_DEBUG_OBJECT (self, "Add remote audio ssrc: %u", ssrc);
+       self->remote_audio_ssrc = ssrc;
+-    }
+-    else {
++    } else {
+       GST_DEBUG_OBJECT (self, "Remote SDP doesn't include audio SSRC");
+     }
+ 
+@@ -603,13 +1067,11 @@ kms_base_rtp_session_process_remote_ssrc (KmsBaseRtpSession * self,
+     gst_sdp_media_copy (neg_media, &self->audio_neg);
+ 
+     return AUDIO_RTP_SESSION_STR;
+-  }
+-  else if (g_strcmp0 (VIDEO_STREAM_NAME, media_str) == 0) {
++  } else if (g_strcmp0 (VIDEO_STREAM_NAME, media_str) == 0) {
+     if (ssrc != SSRC_INVALID) {
+       GST_DEBUG_OBJECT (self, "Add remote video ssrc: %u", ssrc);
+       self->remote_video_ssrc = ssrc;
+-    }
+-    else {
++    } else {
+       GST_DEBUG_OBJECT (self, "Remote SDP doesn't include video SSRC");
+     }
+ 
+@@ -627,9 +1089,11 @@ kms_base_rtp_session_process_remote_ssrc (KmsBaseRtpSession * self,
+ }
+ 
+ static gboolean
+-kms_base_rtp_session_configure_media_connection (KmsBaseRtpSession * self,
+-    KmsSdpMediaHandler * handler, const GstSDPMedia * neg_media,
+-    const GstSDPMedia * remote_media, gboolean offerer)
++kms_base_rtp_session_configure_media_connection (KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler,
++    const GstSDPMedia *neg_media,
++    const GstSDPMedia *remote_media,
++    gboolean offerer)
+ {
+   const gchar *neg_proto_str = gst_sdp_media_get_proto (neg_media);
+   const gchar *neg_media_str = gst_sdp_media_get_media (neg_media);
+@@ -658,9 +1122,9 @@ kms_base_rtp_session_configure_media_connection (KmsBaseRtpSession * self,
+     return FALSE;
+   }
+ 
+-  if (kms_base_rtp_session_process_remote_ssrc (self, remote_media,
+-          neg_media) == NULL) {
+-    return TRUE;                /* It cannot be managed here but could be managed by the child class */
++  if (kms_base_rtp_session_process_remote_ssrc (self, remote_media, neg_media)
++      == NULL) {
++    return TRUE; /* It cannot be managed here but could be managed by the child class */
+   }
+ 
+   active = sdp_utils_media_is_active (neg_media, offerer);
+@@ -670,7 +1134,7 @@ kms_base_rtp_session_configure_media_connection (KmsBaseRtpSession * self,
+ }
+ 
+ static void
+-kms_base_rtp_session_update_conn_state (KmsBaseRtpSession * self)
++kms_base_rtp_session_update_conn_state (KmsBaseRtpSession *self)
+ {
+   GHashTableIter iter;
+   gpointer key, v;
+@@ -706,7 +1170,7 @@ kms_base_rtp_session_update_conn_state (KmsBaseRtpSession * self)
+ }
+ 
+ static void
+-kms_base_rtp_session_connected_cb (KmsIRtpConnection * conn, gpointer user_data)
++kms_base_rtp_session_connected_cb (KmsIRtpConnection *conn, gpointer user_data)
+ {
+   KmsBaseRtpSession *self = KMS_BASE_RTP_SESSION (user_data);
+ 
+@@ -714,7 +1178,7 @@ kms_base_rtp_session_connected_cb (KmsIRtpConnection * conn, gpointer user_data)
+ }
+ 
+ static void
+-kms_base_rtp_session_check_conn_status (KmsBaseRtpSession * self)
++kms_base_rtp_session_check_conn_status (KmsBaseRtpSession *self)
+ {
+   GHashTableIter iter;
+   gpointer key, v;
+@@ -735,7 +1199,7 @@ kms_base_rtp_session_check_conn_status (KmsBaseRtpSession * self)
+ }
+ 
+ void
+-kms_base_rtp_session_start_transport_send (KmsBaseRtpSession * self,
++kms_base_rtp_session_start_transport_send (KmsBaseRtpSession *self,
+     gboolean offerer)
+ {
+   KmsSdpSession *sdp_sess = KMS_SDP_SESSION (self);
+@@ -770,9 +1234,10 @@ kms_base_rtp_session_start_transport_send (KmsBaseRtpSession * self,
+       continue;
+     }
+ 
+-    if (!kms_base_rtp_session_configure_media_connection (self, handler, neg_media,
+-            rem_media, offerer)) {
+-      GST_WARNING_OBJECT (self, "Cannot configure connection for media (id=%u)", i);
++    if (!kms_base_rtp_session_configure_media_connection (self, handler,
++            neg_media, rem_media, offerer)) {
++      GST_WARNING_OBJECT (self, "Cannot configure connection for media (id=%u)",
++          i);
+     }
+ 
+     g_object_unref (handler);
+@@ -782,7 +1247,8 @@ kms_base_rtp_session_start_transport_send (KmsBaseRtpSession * self,
+ /* Start Transport Send end */
+ 
+ static void
+-kms_base_rtp_session_enable_connection_stats (gpointer key, gpointer value,
++kms_base_rtp_session_enable_connection_stats (gpointer key,
++    gpointer value,
+     gpointer user_data)
+ {
+   kms_i_rtp_connection_collect_latency_stats (KMS_I_RTP_CONNECTION (value),
+@@ -790,7 +1256,8 @@ kms_base_rtp_session_enable_connection_stats (gpointer key, gpointer value,
+ }
+ 
+ static void
+-kms_base_rtp_session_disable_connection_stats (gpointer key, gpointer value,
++kms_base_rtp_session_disable_connection_stats (gpointer key,
++    gpointer value,
+     gpointer user_data)
+ {
+   kms_i_rtp_connection_collect_latency_stats (KMS_I_RTP_CONNECTION (value),
+@@ -798,7 +1265,7 @@ kms_base_rtp_session_disable_connection_stats (gpointer key, gpointer value,
+ }
+ 
+ void
+-kms_base_rtp_session_enable_connections_stats (KmsBaseRtpSession * self)
++kms_base_rtp_session_enable_connections_stats (KmsBaseRtpSession *self)
+ {
+   self->stats_enabled = TRUE;
+ 
+@@ -807,7 +1274,7 @@ kms_base_rtp_session_enable_connections_stats (KmsBaseRtpSession * self)
+ }
+ 
+ void
+-kms_base_rtp_session_disable_connections_stats (KmsBaseRtpSession * self)
++kms_base_rtp_session_disable_connections_stats (KmsBaseRtpSession *self)
+ {
+   self->stats_enabled = FALSE;
+ 
+@@ -816,27 +1283,29 @@ kms_base_rtp_session_disable_connections_stats (KmsBaseRtpSession * self)
+ }
+ 
+ static void
+-kms_base_rtp_session_get_property (GObject * object, guint property_id,
+-    GValue * value, GParamSpec * pspec)
++kms_base_rtp_session_get_property (GObject *object,
++    guint property_id,
++    GValue *value,
++    GParamSpec *pspec)
+ {
+   KmsBaseRtpSession *self = KMS_BASE_RTP_SESSION (object);
+ 
+   KMS_SDP_SESSION_LOCK (self);
+ 
+   switch (property_id) {
+-    case PROP_CONNECTION_STATE:
+-      g_value_set_enum (value, self->conn_state);
+-      break;
+-    default:
+-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+-      break;
++  case PROP_CONNECTION_STATE:
++    g_value_set_enum (value, self->conn_state);
++    break;
++  default:
++    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++    break;
+   }
+ 
+   KMS_SDP_SESSION_UNLOCK (self);
+ }
+ 
+ static void
+-kms_base_rtp_session_finalize (GObject * object)
++kms_base_rtp_session_finalize (GObject *object)
+ {
+   KmsBaseRtpSession *self = KMS_BASE_RTP_SESSION (object);
+ 
+@@ -857,18 +1326,20 @@ kms_base_rtp_session_finalize (GObject * object)
+ }
+ 
+ static void
+-kms_base_rtp_session_post_constructor (KmsBaseRtpSession * self,
+-    KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager)
++kms_base_rtp_session_post_constructor (KmsBaseRtpSession *self,
++    KmsBaseSdpEndpoint *ep,
++    guint id,
++    KmsIRtpSessionManager *manager)
+ {
+   KmsSdpSession *sdp_sess = KMS_SDP_SESSION (self);
+ 
+   self->manager = manager;
+-  KMS_SDP_SESSION_CLASS
+-      (kms_base_rtp_session_parent_class)->post_constructor (sdp_sess, ep, id);
++  KMS_SDP_SESSION_CLASS (kms_base_rtp_session_parent_class)
++      ->post_constructor (sdp_sess, ep, id);
+ }
+ 
+ static void
+-kms_base_rtp_session_init (KmsBaseRtpSession * self)
++kms_base_rtp_session_init (KmsBaseRtpSession *self)
+ {
+   self->conns =
+       g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_object_unref);
+@@ -883,7 +1354,7 @@ kms_base_rtp_session_init (KmsBaseRtpSession * self)
+ }
+ 
+ static void
+-kms_base_rtp_session_class_init (KmsBaseRtpSessionClass * klass)
++kms_base_rtp_session_class_init (KmsBaseRtpSessionClass *klass)
+ {
+   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
+   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);
+@@ -903,10 +1374,8 @@ kms_base_rtp_session_class_init (KmsBaseRtpSessionClass * klass)
+   klass->create_bundle_connection =
+       kms_base_rtp_session_create_bundle_connection_default;
+ 
+-  gst_element_class_set_details_simple (gstelement_class,
+-      "BaseRtpSession",
+-      "Generic",
+-      "Base bin to manage elements related with a RTP session.",
++  gst_element_class_set_details_simple (gstelement_class, "BaseRtpSession",
++      "Generic", "Base bin to manage elements related with a RTP session.",
+       "Miguel París Díaz <mparisdiaz@gmail.com>");
+ 
+   g_object_class_install_property (gobject_class, PROP_CONNECTION_STATE,
+@@ -914,11 +1383,22 @@ kms_base_rtp_session_class_init (KmsBaseRtpSessionClass * klass)
+           "Connection state", KMS_TYPE_CONNECTION_STATE,
+           DEFAULT_CONNECTION_STATE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+ 
+-  obj_signals[CONNECTION_STATE_CHANGED] =
+-      g_signal_new ("connection-state-changed",
+-      G_TYPE_FROM_CLASS (klass),
+-      G_SIGNAL_RUN_LAST,
++  obj_signals[CONNECTION_STATE_CHANGED] = g_signal_new (
++      "connection-state-changed", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+       G_STRUCT_OFFSET (KmsBaseRtpSessionClass, connection_state_changed), NULL,
+       NULL, g_cclosure_marshal_VOID__ENUM, G_TYPE_NONE, 1,
+       KMS_TYPE_CONNECTION_STATE);
++
++  obj_signals[DTMF_EVENT_DETECTED] = g_signal_new ("dtmf-event-detected",
++      G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++      G_STRUCT_OFFSET (KmsBaseRtpSessionClass,
++          dtmf_event_detected), // No class offset
++      NULL, NULL,
++      __kms_core_marshal_VOID__INT_BOOLEAN_INT_INT_STRING, // Custom marshaller
++      G_TYPE_NONE, 5,
++      G_TYPE_INT, // number
++      G_TYPE_BOOLEAN, // end
++      G_TYPE_INT, // volume
++      G_TYPE_INT, // duration
++      G_TYPE_STRING); // media_type
+ }
+diff --git a/server/module-core/src/gst-plugins/commons/kmsbasertpsession.h b/server/module-core/src/gst-plugins/commons/kmsbasertpsession.h
+index 4872bca31..41a2e8582 100644
+--- a/server/module-core/src/gst-plugins/commons/kmsbasertpsession.h
++++ b/server/module-core/src/gst-plugins/commons/kmsbasertpsession.h
+@@ -29,24 +29,24 @@ G_BEGIN_DECLS
+ typedef struct _KmsIRtpSessionManager KmsIRtpSessionManager;
+ 
+ /* #defines don't like whitespacey bits */
+-#define KMS_TYPE_BASE_RTP_SESSION \
+-  (kms_base_rtp_session_get_type())
++#define KMS_TYPE_BASE_RTP_SESSION (kms_base_rtp_session_get_type ())
+ #define KMS_BASE_RTP_SESSION(obj) \
+-  (G_TYPE_CHECK_INSTANCE_CAST((obj),KMS_TYPE_BASE_RTP_SESSION,KmsBaseRtpSession))
++  (G_TYPE_CHECK_INSTANCE_CAST ((obj), KMS_TYPE_BASE_RTP_SESSION, \
++      KmsBaseRtpSession))
+ #define KMS_BASE_RTP_SESSION_CLASS(klass) \
+-  (G_TYPE_CHECK_CLASS_CAST((klass),KMS_TYPE_BASE_RTP_SESSION,KmsBaseRtpSessionClass))
++  (G_TYPE_CHECK_CLASS_CAST ((klass), KMS_TYPE_BASE_RTP_SESSION, \
++      KmsBaseRtpSessionClass))
+ #define KMS_IS_BASE_RTP_SESSION(obj) \
+-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),KMS_TYPE_BASE_RTP_SESSION))
++  (G_TYPE_CHECK_INSTANCE_TYPE ((obj), KMS_TYPE_BASE_RTP_SESSION))
+ #define KMS_IS_BASE_RTP_SESSION_CLASS(klass) \
+-  (G_TYPE_CHECK_CLASS_TYPE((klass),KMS_TYPE_BASE_RTP_SESSION))
+-#define KMS_BASE_RTP_SESSION_CAST(obj) ((KmsBaseRtpSession*)(obj))
++  (G_TYPE_CHECK_CLASS_TYPE ((klass), KMS_TYPE_BASE_RTP_SESSION))
++#define KMS_BASE_RTP_SESSION_CAST(obj) ((KmsBaseRtpSession *)(obj))
+ 
+ typedef struct _KmsBaseRtpSession KmsBaseRtpSession;
+ typedef struct _KmsBaseRtpSessionClass KmsBaseRtpSessionClass;
+ typedef struct _KmsBaseRTPSessionStats KmsBaseRTPSessionStats;
+ 
+-struct _KmsBaseRtpSession
+-{
++struct _KmsBaseRtpSession {
+   KmsSdpSession parent;
+ 
+   KmsIRtpSessionManager *manager;
+@@ -64,32 +64,63 @@ struct _KmsBaseRtpSession
+   gboolean stats_enabled;
+ };
+ 
+-struct _KmsBaseRtpSessionClass
+-{
++struct _KmsBaseRtpSessionClass {
+   KmsSdpSessionClass parent_class;
+ 
+   /* private */
+   /* virtual methods */
+-  void (*post_constructor) (KmsBaseRtpSession * self, KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager);
+-
+-  KmsIRtpConnection * (*create_connection) (KmsBaseRtpSession *self, const GstSDPMedia * media, const gchar *name, guint16 min_port, guint16 max_port);
+-  KmsIRtcpMuxConnection* (*create_rtcp_mux_connection) (KmsBaseRtpSession *self, const gchar *name, guint16 min_port, guint16 max_port);
+-  KmsIBundleConnection * (*create_bundle_connection) (KmsBaseRtpSession *self, const gchar *name, guint16 min_port, guint16 max_port);
+-
+-  void (*connection_state_changed) (KmsBaseRtpSession * self, KmsConnectionState new_state);
++  void (*post_constructor) (KmsBaseRtpSession *self,
++      KmsBaseSdpEndpoint *ep,
++      guint id,
++      KmsIRtpSessionManager *manager);
++
++  KmsIRtpConnection *(*create_connection) (KmsBaseRtpSession *self,
++      const GstSDPMedia *media,
++      const gchar *name,
++      guint16 min_port,
++      guint16 max_port);
++  KmsIRtcpMuxConnection *(*create_rtcp_mux_connection) (KmsBaseRtpSession *self,
++      const gchar *name,
++      guint16 min_port,
++      guint16 max_port);
++  KmsIBundleConnection *(*create_bundle_connection) (KmsBaseRtpSession *self,
++      const gchar *name,
++      guint16 min_port,
++      guint16 max_port);
++
++  void (*connection_state_changed) (KmsBaseRtpSession *self,
++      KmsConnectionState new_state);
++
++  void (*dtmf_event_detected) (KmsBaseRtpSession *self,
++      gint number,
++      gboolean end,
++      gint volume,
++      gint duration,
++      const gchar *media_type);
+ };
+ 
+ GType kms_base_rtp_session_get_type (void);
+ 
+-KmsBaseRtpSession * kms_base_rtp_session_new (KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager);
+-KmsIRtpConnection * kms_base_rtp_session_get_connection_by_name (KmsBaseRtpSession * self, const gchar * name);
+-KmsIRtpConnection * kms_base_rtp_session_get_connection (KmsBaseRtpSession * self, KmsSdpMediaHandler *handler);
+-KmsIRtpConnection * kms_base_rtp_session_create_connection (KmsBaseRtpSession * self, KmsSdpMediaHandler *handler, GstSDPMedia * media, guint16 min_port, guint16 max_port);
+-
+-void kms_base_rtp_session_start_transport_send (KmsBaseRtpSession * self, gboolean offerer);
+-
+-void kms_base_rtp_session_enable_connections_stats (KmsBaseRtpSession * self);
+-void kms_base_rtp_session_disable_connections_stats (KmsBaseRtpSession * self);
++KmsBaseRtpSession *kms_base_rtp_session_new (KmsBaseSdpEndpoint *ep,
++    guint id,
++    KmsIRtpSessionManager *manager);
++KmsIRtpConnection *kms_base_rtp_session_get_connection_by_name (
++    KmsBaseRtpSession *self,
++    const gchar *name);
++KmsIRtpConnection *kms_base_rtp_session_get_connection (KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler);
++KmsIRtpConnection *kms_base_rtp_session_create_connection (
++    KmsBaseRtpSession *self,
++    KmsSdpMediaHandler *handler,
++    GstSDPMedia *media,
++    guint16 min_port,
++    guint16 max_port);
++
++void kms_base_rtp_session_start_transport_send (KmsBaseRtpSession *self,
++    gboolean offerer);
++
++void kms_base_rtp_session_enable_connections_stats (KmsBaseRtpSession *self);
++void kms_base_rtp_session_disable_connections_stats (KmsBaseRtpSession *self);
+ 
+ G_END_DECLS
+ #endif /* __KMS_BASE_RTP_SESSION_H__ */
+diff --git a/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.cpp b/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.cpp
+index 82f005cb0..ef0dc4cb7 100644
+--- a/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.cpp
++++ b/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.cpp
+@@ -56,58 +56,66 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
+ #define PROP_MTU "mtu"
+ 
+ /* Fixed point conversion macros */
+-#define FRIC        65536.                  /* 2^16 as a double */
+-#define FP2D(r)     ((double)(r) / FRIC)
++#define FRIC 65536. /* 2^16 as a double */
++#define FP2D(r) ((double)(r) / FRIC)
+ 
+ namespace kurento
+ {
+-void BaseRtpEndpointImpl::postConstructor ()
++void
++BaseRtpEndpointImpl::postConstructor ()
+ {
+   SdpEndpointImpl::postConstructor ();
+ 
+   mediaStateChangedHandlerId = register_signal_handler (G_OBJECT (element),
+-                               "media-state-changed",
+-                               std::function <void (GstElement *, guint) > (std::bind (
+-                                     &BaseRtpEndpointImpl::updateMediaState, this,
+-                                     std::placeholders::_2) ),
+-                               std::dynamic_pointer_cast<BaseRtpEndpointImpl>
+-                               (shared_from_this() ) );
+-
+-  connStateChangedHandlerId = register_signal_handler (G_OBJECT (element),
+-                              "connection-state-changed",
+-                              std::function <void (GstElement *, gchar *, guint) > (std::bind (
+-                                    &BaseRtpEndpointImpl::updateConnectionState, this,
+-                                    std::placeholders::_2, std::placeholders::_3) ),
+-                              std::dynamic_pointer_cast<BaseRtpEndpointImpl>
+-                              (shared_from_this() ) );
++      "media-state-changed",
++      std::function<void (GstElement *, guint)> (std::bind (
++          &BaseRtpEndpointImpl::updateMediaState, this, std::placeholders::_2)),
++      std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this ()));
++
++  connStateChangedHandlerId =
++      register_signal_handler (G_OBJECT (element), "connection-state-changed",
++          std::function<void (GstElement *, gchar *, guint)> (
++              std::bind (&BaseRtpEndpointImpl::updateConnectionState, this,
++                  std::placeholders::_2, std::placeholders::_3)),
++          std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this ()));
++
++  dtmfEventDetectedHandlerId = register_signal_handler (G_OBJECT (element),
++      "dtmf-event-detected",
++      std::function<void (GstElement *, gint, gboolean, gint, gint,
++          const gchar *)> (std::bind (&BaseRtpEndpointImpl::onDtmfEventDetected,
++          this, std::placeholders::_2, std::placeholders::_3,
++          std::placeholders::_4, std::placeholders::_5, std::placeholders::_6)),
++      std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this ()));
+ }
+ 
+-BaseRtpEndpointImpl::BaseRtpEndpointImpl (const boost::property_tree::ptree
+-    &config,
+-    std::shared_ptr< MediaObjectImpl > parent,
+-    const std::string &factoryName, bool useIpv6) :
+-  SdpEndpointImpl (config, parent, factoryName, useIpv6)
++BaseRtpEndpointImpl::BaseRtpEndpointImpl (
++    const boost::property_tree::ptree &config,
++    std::shared_ptr<MediaObjectImpl> parent,
++    const std::string &factoryName,
++    bool useIpv6)
++    : SdpEndpointImpl (config, parent, factoryName, useIpv6)
+ {
+-  current_media_state = std::make_shared <MediaState>
+-                        (MediaState::DISCONNECTED);
++  current_media_state = std::make_shared<MediaState> (MediaState::DISCONNECTED);
+   mediaStateChangedHandlerId = 0;
+ 
+-  current_conn_state = std::make_shared <ConnectionState>
+-                       (ConnectionState::DISCONNECTED);
++  current_conn_state =
++      std::make_shared<ConnectionState> (ConnectionState::DISCONNECTED);
+   connStateChangedHandlerId = 0;
+ 
++  dtmfEventDetectedHandlerId = 0;
++
+   guint minPort = 0;
+   if (getConfigValue<guint, BaseRtpEndpoint> (&minPort, PARAM_MIN_PORT)) {
+     g_object_set (getGstreamerElement (), PROP_MIN_PORT, minPort, NULL);
+   }
+ 
+   guint maxPort = 0;
+-  if (getConfigValue <guint, BaseRtpEndpoint> (&maxPort, PARAM_MAX_PORT)) {
++  if (getConfigValue<guint, BaseRtpEndpoint> (&maxPort, PARAM_MAX_PORT)) {
+     g_object_set (getGstreamerElement (), PROP_MAX_PORT, maxPort, NULL);
+   }
+ 
+   guint mtu;
+-  if (getConfigValue <guint, BaseRtpEndpoint> (&mtu, PARAM_MTU)) {
++  if (getConfigValue<guint, BaseRtpEndpoint> (&mtu, PARAM_MTU)) {
+     GST_INFO ("Predefined RTP MTU: %u", mtu);
+     g_object_set (G_OBJECT (element), PROP_MTU, mtu, NULL);
+   } else {
+@@ -124,6 +132,10 @@ BaseRtpEndpointImpl::~BaseRtpEndpointImpl ()
+   if (connStateChangedHandlerId > 0) {
+     unregister_signal_handler (element, connStateChangedHandlerId);
+   }
++
++  if (dtmfEventDetectedHandlerId > 0) {
++    unregister_signal_handler (element, dtmfEventDetectedHandlerId);
++  }
+ }
+ 
+ void
+@@ -147,13 +159,12 @@ BaseRtpEndpointImpl::updateMediaState (guint new_state)
+ 
+   switch (new_state) {
+   case KMS_MEDIA_DISCONNECTED:
+-    current_media_state = std::make_shared <MediaState>
+-                          (MediaState::DISCONNECTED);
++    current_media_state =
++        std::make_shared<MediaState> (MediaState::DISCONNECTED);
+     break;
+ 
+   case KMS_MEDIA_CONNECTED:
+-    current_media_state = std::make_shared <MediaState>
+-                          (MediaState::CONNECTED);
++    current_media_state = std::make_shared<MediaState> (MediaState::CONNECTED);
+     break;
+ 
+   default:
+@@ -161,13 +172,13 @@ BaseRtpEndpointImpl::updateMediaState (guint new_state)
+     return;
+   }
+ 
+-  if (old_state->getValue() != current_media_state->getValue() ) {
++  if (old_state->getValue () != current_media_state->getValue ()) {
+     GST_DEBUG_OBJECT (element, "MediaState changed to '%s'",
+-        current_media_state->getString().c_str());
++        current_media_state->getString ().c_str ());
+     try {
+       MediaStateChanged event (shared_from_this (),
+           MediaStateChanged::getName (), old_state, current_media_state);
+-      sigcSignalEmit(signalMediaStateChanged, event);
++      sigcSignalEmit (signalMediaStateChanged, event);
+     } catch (const std::bad_weak_ptr &e) {
+       // shared_from_this()
+       GST_ERROR ("BUG creating %s: %s", MediaStateChanged::getName ().c_str (),
+@@ -184,13 +195,13 @@ BaseRtpEndpointImpl::updateConnectionState (gchar *sessId, guint new_state)
+ 
+   switch (new_state) {
+   case KMS_CONNECTION_DISCONNECTED:
+-    current_conn_state = std::make_shared <ConnectionState>
+-                         (ConnectionState::DISCONNECTED);
++    current_conn_state =
++        std::make_shared<ConnectionState> (ConnectionState::DISCONNECTED);
+     break;
+ 
+   case KMS_CONNECTION_CONNECTED:
+-    current_conn_state = std::make_shared <ConnectionState>
+-                         (ConnectionState::CONNECTED);
++    current_conn_state =
++        std::make_shared<ConnectionState> (ConnectionState::CONNECTED);
+     break;
+ 
+   default:
+@@ -198,13 +209,13 @@ BaseRtpEndpointImpl::updateConnectionState (gchar *sessId, guint new_state)
+     return;
+   }
+ 
+-  if (old_state->getValue() != current_conn_state->getValue() ) {
++  if (old_state->getValue () != current_conn_state->getValue ()) {
+     GST_DEBUG_OBJECT (element, "ConnectionState changed to '%s'",
+-        current_conn_state->getString().c_str());
++        current_conn_state->getString ().c_str ());
+     try {
+-      ConnectionStateChanged event (shared_from_this(),
++      ConnectionStateChanged event (shared_from_this (),
+           ConnectionStateChanged::getName (), old_state, current_conn_state);
+-      sigcSignalEmit(signalConnectionStateChanged, event);
++      sigcSignalEmit (signalConnectionStateChanged, event);
+     } catch (const std::bad_weak_ptr &e) {
+       // shared_from_this()
+       GST_ERROR ("BUG creating %s: %s",
+@@ -213,49 +224,84 @@ BaseRtpEndpointImpl::updateConnectionState (gchar *sessId, guint new_state)
+   }
+ }
+ 
+-int BaseRtpEndpointImpl::getMinVideoRecvBandwidth ()
++void
++BaseRtpEndpointImpl::onDtmfEventDetected (gint number,
++    gboolean end,
++    gint volume,
++    gint duration,
++    const gchar *mediaType)
++{
++  // Example logic — you can add your actual processing or logging here
++  std::cout << "DTMF Detected:"
++            << " Number: " << number << ", End: " << end
++            << ", Volume: " << volume << ", Duration: " << duration
++            << ", MediaType: " << mediaType << std::endl;
++
++  try {
++    DtmfEventDetected event (shared_from_this (), DtmfEventDetected::getName (),
++        number, end, volume, duration, mediaType);
++    sigcSignalEmit (signalDtmfEventDetected, event);
++  } catch (const std::bad_weak_ptr &e) {
++    // shared_from_this()
++    GST_ERROR ("BUG creating %s: %s", DtmfEventDetected::getName ().c_str (),
++        e.what ());
++  }
++
++  // You might also want to emit a signal to JS or invoke internal handlers
++}
++
++int
++BaseRtpEndpointImpl::getMinVideoRecvBandwidth ()
+ {
+   int minVideoRecvBandwidth;
+ 
+   g_object_get (element, "min-video-recv-bandwidth", &minVideoRecvBandwidth,
+-                NULL);
++      NULL);
+ 
+   return minVideoRecvBandwidth;
+ }
+ 
+-void BaseRtpEndpointImpl::setMinVideoRecvBandwidth (int minVideoRecvBandwidth)
++void
++BaseRtpEndpointImpl::setMinVideoRecvBandwidth (int minVideoRecvBandwidth)
+ {
+-  g_object_set (element, "min-video-recv-bandwidth", minVideoRecvBandwidth, NULL);
++  g_object_set (element, "min-video-recv-bandwidth", minVideoRecvBandwidth,
++      NULL);
+ }
+ 
+-int BaseRtpEndpointImpl::getMinVideoSendBandwidth ()
++int
++BaseRtpEndpointImpl::getMinVideoSendBandwidth ()
+ {
+   int minVideoSendBandwidth;
+ 
+   g_object_get (element, "min-video-send-bandwidth", &minVideoSendBandwidth,
+-                NULL);
++      NULL);
+ 
+   return minVideoSendBandwidth;
+ }
+ 
+-void BaseRtpEndpointImpl::setMinVideoSendBandwidth (int minVideoSendBandwidth)
++void
++BaseRtpEndpointImpl::setMinVideoSendBandwidth (int minVideoSendBandwidth)
+ {
+-  g_object_set (element, "min-video-send-bandwidth", minVideoSendBandwidth, NULL);
++  g_object_set (element, "min-video-send-bandwidth", minVideoSendBandwidth,
++      NULL);
+ }
+ 
+-int BaseRtpEndpointImpl::getMaxVideoSendBandwidth ()
++int
++BaseRtpEndpointImpl::getMaxVideoSendBandwidth ()
+ {
+   int maxVideoSendBandwidth;
+ 
+   g_object_get (element, "max-video-send-bandwidth", &maxVideoSendBandwidth,
+-                NULL);
++      NULL);
+ 
+   return maxVideoSendBandwidth;
+ }
+ 
+-void BaseRtpEndpointImpl::setMaxVideoSendBandwidth (int maxVideoSendBandwidth)
++void
++BaseRtpEndpointImpl::setMaxVideoSendBandwidth (int maxVideoSendBandwidth)
+ {
+-  g_object_set (element, "max-video-send-bandwidth", maxVideoSendBandwidth, NULL);
++  g_object_set (element, "max-video-send-bandwidth", maxVideoSendBandwidth,
++      NULL);
+ }
+ 
+ std::shared_ptr<MediaState>
+@@ -273,7 +319,7 @@ BaseRtpEndpointImpl::getConnectionState ()
+ std::shared_ptr<RembParams>
+ BaseRtpEndpointImpl::getRembParams ()
+ {
+-  std::shared_ptr<RembParams> ret (new RembParams() );
++  std::shared_ptr<RembParams> ret (new RembParams ());
+   GstStructure *params;
+   gint auxi;
+   gfloat auxf;
+@@ -286,7 +332,7 @@ BaseRtpEndpointImpl::getRembParams ()
+ 
+   /* REMB local begin */
+   gst_structure_get (params, "packets-recv-interval-top", G_TYPE_INT, &auxi,
+-                     NULL);
++      NULL);
+   ret->setPacketsRecvIntervalTop (auxi);
+ 
+   gst_structure_get (params, "exponential-factor", G_TYPE_FLOAT, &auxf, NULL);
+@@ -324,63 +370,63 @@ BaseRtpEndpointImpl::setRembParams (std::shared_ptr<RembParams> rembParams)
+   GstStructure *params = gst_structure_new_empty (REMB_PARAMS);
+ 
+   /* REMB local begin */
+-  if (rembParams->isSetPacketsRecvIntervalTop () ) {
++  if (rembParams->isSetPacketsRecvIntervalTop ()) {
+     gst_structure_set (params, "packets-recv-interval-top", G_TYPE_INT,
+-                       rembParams->getPacketsRecvIntervalTop(), NULL);
++        rembParams->getPacketsRecvIntervalTop (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'packetsRecvIntervalTop' value: %d",
+-                      rembParams->getPacketsRecvIntervalTop() );
++        rembParams->getPacketsRecvIntervalTop ());
+   }
+ 
+-  if (rembParams->isSetExponentialFactor () ) {
++  if (rembParams->isSetExponentialFactor ()) {
+     gst_structure_set (params, "exponential-factor", G_TYPE_FLOAT,
+-                       rembParams->getExponentialFactor(), NULL);
++        rembParams->getExponentialFactor (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'exponentialFactor' value: %g",
+-                      rembParams->getExponentialFactor() );
++        rembParams->getExponentialFactor ());
+   }
+ 
+-  if (rembParams->isSetLinealFactorMin () ) {
++  if (rembParams->isSetLinealFactorMin ()) {
+     gst_structure_set (params, "lineal-factor-min", G_TYPE_INT,
+-                       rembParams->getLinealFactorMin(), NULL);
++        rembParams->getLinealFactorMin (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'linealFactorMin' value: %d",
+-                      rembParams->getLinealFactorMin() );
++        rembParams->getLinealFactorMin ());
+   }
+ 
+-  if (rembParams->isSetLinealFactorGrade () ) {
++  if (rembParams->isSetLinealFactorGrade ()) {
+     gst_structure_set (params, "lineal-factor-grade", G_TYPE_FLOAT,
+-                       rembParams->getLinealFactorGrade(), NULL);
++        rembParams->getLinealFactorGrade (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'linealFactorGrade' value: %g",
+-                      rembParams->getLinealFactorGrade() );
++        rembParams->getLinealFactorGrade ());
+   }
+ 
+-  if (rembParams->isSetDecrementFactor () ) {
++  if (rembParams->isSetDecrementFactor ()) {
+     gst_structure_set (params, "decrement-factor", G_TYPE_FLOAT,
+-                       rembParams->getDecrementFactor(), NULL);
++        rembParams->getDecrementFactor (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'decrementFactor' value: %g",
+-                      rembParams->getDecrementFactor() );
++        rembParams->getDecrementFactor ());
+   }
+ 
+-  if (rembParams->isSetThresholdFactor () ) {
++  if (rembParams->isSetThresholdFactor ()) {
+     gst_structure_set (params, "threshold-factor", G_TYPE_FLOAT,
+-                       rembParams->getThresholdFactor(), NULL);
++        rembParams->getThresholdFactor (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'thresholdFactor' value: %g",
+-                      rembParams->getThresholdFactor() );
++        rembParams->getThresholdFactor ());
+   }
+ 
+-  if (rembParams->isSetUpLosses () ) {
++  if (rembParams->isSetUpLosses ()) {
+     gst_structure_set (params, "up-losses", G_TYPE_INT,
+-                       rembParams->getUpLosses(), NULL);
++        rembParams->getUpLosses (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'upLosses' value: %d",
+-                      rembParams->getUpLosses() );
++        rembParams->getUpLosses ());
+   }
+ 
+   /* REMB local end */
+ 
+   /* REMB remote begin */
+-  if (rembParams->isSetRembOnConnect () ) {
++  if (rembParams->isSetRembOnConnect ()) {
+     gst_structure_set (params, "remb-on-connect", G_TYPE_INT,
+-                       rembParams->getRembOnConnect(), NULL);
++        rembParams->getRembOnConnect (), NULL);
+     GST_DEBUG_OBJECT (element, "New 'rembOnConnect' value: %d",
+-                      rembParams->getRembOnConnect() );
++        rembParams->getRembOnConnect ());
+   }
+ 
+   /* REMB remote end */
+@@ -420,39 +466,37 @@ createRTCInboundRTPStreamStats (const GstStructure *source_stats,
+   gint packetLost, clock_rate;
+   float jitterSec;
+ 
+-  packetLost = jitter = fractionLost = pliCount = firCount = remb =
+-                                         clock_rate = 0;
++  packetLost = jitter = fractionLost = pliCount = firCount = remb = clock_rate =
++      0;
+   bytesReceived = packetsReceived = G_GUINT64_CONSTANT (0);
+   jitterSec = 0.0;
+ 
+-  gst_structure_get (source_stats,
+-                     "packets-received", G_TYPE_UINT64, &packetsReceived,
+-                     "octets-received", G_TYPE_UINT64, &bytesReceived,
+-                     "sent-rb-packetslost", G_TYPE_INT, &packetLost,
+-                     "sent-rb-fractionlost", G_TYPE_UINT, &fractionLost,
+-                     "clock-rate", G_TYPE_INT, &clock_rate,
+-                     "jitter", G_TYPE_UINT, &jitter,
+-                     NULL);
++  gst_structure_get (source_stats, "packets-received", G_TYPE_UINT64,
++      &packetsReceived, "octets-received", G_TYPE_UINT64, &bytesReceived,
++      "sent-rb-packetslost", G_TYPE_INT, &packetLost, "sent-rb-fractionlost",
++      G_TYPE_UINT, &fractionLost, "clock-rate", G_TYPE_INT, &clock_rate,
++      "jitter", G_TYPE_UINT, &jitter, NULL);
+ 
+   /* jitter is computed in timestamp units. Convert it to seconds */
+   if (clock_rate > 0) {
+-    jitterSec = (float) jitter / clock_rate;
++    jitterSec = (float)jitter / clock_rate;
+   }
+ 
+   /* Next fields are only available with PLI and FIR statistics patches so */
+   /* hey are prone to fail if these patches are not applied in Gstreamer */
+-  if (!gst_structure_get (source_stats, "sent-pli-count", G_TYPE_UINT, &pliCount,
+-                          "sent-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
+-    GST_WARNING ("Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
++  if (!gst_structure_get (source_stats, "sent-pli-count", G_TYPE_UINT,
++          &pliCount, "sent-fir-count", G_TYPE_UINT, &firCount, NULL)) {
++    GST_WARNING (
++        "Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
+   }
+ 
+-  if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL) ) {
++  if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL)) {
+     GST_TRACE ("No remb stats collected");
+   }
+ 
+   return std::make_shared<RTCInboundRTPStreamStats> (id,
+-      std::make_shared<StatsType> (StatsType::inboundrtp), 0, ssrc, "",
+-      false, "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
++      std::make_shared<StatsType> (StatsType::inboundrtp), 0, ssrc, "", false,
++      "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
+       (float)fractionLost, packetsReceived, bytesReceived, jitterSec);
+ }
+ 
+@@ -470,39 +514,38 @@ createRTCOutboundRTPStreamStats (const GstStructure *source_stats,
+   bytesSent = packetsSent = bitRate = G_GUINT64_CONSTANT (0);
+   pliCount = firCount = remb = rtt = 0;
+ 
+-  gst_structure_get (source_stats,
+-                     "packets-sent", G_TYPE_UINT64, &packetsSent,
+-                     "octets-sent", G_TYPE_UINT64, &bytesSent,
+-                     "bitrate", G_TYPE_UINT64, &bitRate,
+-                     "round-trip-time", G_TYPE_UINT, &rtt,
+-                     "outbound-fraction-lost", G_TYPE_UINT, &fractionLost,
+-                     "outbound-packet-lost", G_TYPE_INT, &packetLost,
+-                     NULL);
++  gst_structure_get (source_stats, "packets-sent", G_TYPE_UINT64, &packetsSent,
++      "octets-sent", G_TYPE_UINT64, &bytesSent, "bitrate", G_TYPE_UINT64,
++      &bitRate, "round-trip-time", G_TYPE_UINT, &rtt, "outbound-fraction-lost",
++      G_TYPE_UINT, &fractionLost, "outbound-packet-lost", G_TYPE_INT,
++      &packetLost, NULL);
+ 
+   /* the round-trip time (in NTP Short Format, 16.16 fixed point) */
+   roundTripTime = FP2D (rtt);
+ 
+   /* Next fields are only available with PLI and FIR statistics patches so */
+   /* hey are prone to fail if these patches are not applied in Gstreamer */
+-  if (!gst_structure_get (source_stats, "recv-pli-count", G_TYPE_UINT, &pliCount,
+-                          "recv-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
+-    GST_WARNING ("Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
++  if (!gst_structure_get (source_stats, "recv-pli-count", G_TYPE_UINT,
++          &pliCount, "recv-fir-count", G_TYPE_UINT, &firCount, NULL)) {
++    GST_WARNING (
++        "Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
+   }
+ 
+-  if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL) ) {
++  if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL)) {
+     GST_TRACE ("No remb stats collected");
+   }
+ 
+   return std::make_shared<RTCOutboundRTPStreamStats> (id,
+-      std::make_shared<StatsType> (StatsType::outboundrtp), 0, ssrc, "",
+-      false, "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
++      std::make_shared<StatsType> (StatsType::outboundrtp), 0, ssrc, "", false,
++      "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
+       (float)fractionLost, packetsSent, bytesSent, (float)bitRate,
+       roundTripTime);
+ }
+ 
+ static std::shared_ptr<RTCRTPStreamStats>
+-createRTCRTPStreamStats (guint nackSent, guint nackRecv,
+-                         const GstStructure *source_stats)
++createRTCRTPStreamStats (guint nackSent,
++    guint nackRecv,
++    const GstStructure *source_stats)
+ {
+   std::shared_ptr<RTCRTPStreamStats> rtcStats;
+   gboolean internal;
+@@ -510,7 +553,7 @@ createRTCRTPStreamStats (guint nackSent, guint nackRecv,
+   guint ssrc;
+ 
+   gst_structure_get (source_stats, "ssrc", G_TYPE_UINT, &ssrc, "internal",
+-                     G_TYPE_BOOLEAN, &internal, "id", G_TYPE_STRING, &id, NULL);
++      G_TYPE_BOOLEAN, &internal, "id", G_TYPE_STRING, &id, NULL);
+ 
+   ssrc_str = g_strdup_printf ("%u", ssrc);
+ 
+@@ -531,9 +574,10 @@ createRTCRTPStreamStats (guint nackSent, guint nackRecv,
+ }
+ 
+ static void
+-collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
+-                          &statsReport, int64_t timestampMillis,
+-                          const GstStructure *session_stats)
++collectRTCRTPStreamStats (
++    std::map<std::string, std::shared_ptr<Stats>> &statsReport,
++    int64_t timestampMillis,
++    const GstStructure *session_stats)
+ {
+   guint nackSent, nackRecv;
+   gint i, n;
+@@ -541,7 +585,7 @@ collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
+   nackSent = nackRecv = 0;
+ 
+   gst_structure_get (session_stats, "sent-nack-count", G_TYPE_UINT, &nackSent,
+-                     "recv-nack-count", G_TYPE_UINT, &nackRecv, NULL);
++      "recv-nack-count", G_TYPE_UINT, &nackRecv, NULL);
+ 
+   n = gst_structure_n_fields (session_stats);
+ 
+@@ -553,13 +597,13 @@ collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
+     name = gst_structure_nth_field_name (session_stats, i);
+ 
+     // Check field name as set by kmsbasertpendpoint in `append_rtp_session_stats()`.
+-    if (!g_str_has_prefix (name, KMS_STATISTIC_FIELD_PREFIX_SSRC) ) {
++    if (!g_str_has_prefix (name, KMS_STATISTIC_FIELD_PREFIX_SSRC)) {
+       continue;
+     }
+ 
+     value = gst_structure_get_value (session_stats, name);
+ 
+-    if (!GST_VALUE_HOLDS_STRUCTURE (value) ) {
++    if (!GST_VALUE_HOLDS_STRUCTURE (value)) {
+       gchar *str_val;
+ 
+       str_val = g_strdup_value_contents (value);
+@@ -570,7 +614,7 @@ collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
+     }
+ 
+     rtcStats = createRTCRTPStreamStats (nackSent, nackRecv,
+-                                        gst_value_get_structure (value) );
++        gst_value_get_structure (value));
+ 
+     rtcStats->setTimestampMillis (timestampMillis);
+ 
+@@ -579,9 +623,9 @@ collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
+ }
+ 
+ static void
+-collectRTCStats (std::map <std::string, std::shared_ptr<Stats>>
+-                 &statsReport, int64_t timestampMillis,
+-                 const GstStructure *rtc_stats)
++collectRTCStats (std::map<std::string, std::shared_ptr<Stats>> &statsReport,
++    int64_t timestampMillis,
++    const GstStructure *rtc_stats)
+ {
+   gint i, n;
+ 
+@@ -594,14 +638,14 @@ collectRTCStats (std::map <std::string, std::shared_ptr<Stats>>
+     name = gst_structure_nth_field_name (rtc_stats, i);
+ 
+     // Check field name as set by kmsbasertpendpoint in `append_rtp_session_stats()`.
+-    if (!g_str_has_prefix (name, KMS_STATISTIC_FIELD_PREFIX_SESSION) ) {
++    if (!g_str_has_prefix (name, KMS_STATISTIC_FIELD_PREFIX_SESSION)) {
+       GST_DEBUG ("Ignoring field %s", name);
+       continue;
+     }
+ 
+     value = gst_structure_get_value (rtc_stats, name);
+ 
+-    if (!GST_VALUE_HOLDS_STRUCTURE (value) ) {
++    if (!GST_VALUE_HOLDS_STRUCTURE (value)) {
+       gchar *str_val;
+ 
+       str_val = g_strdup_value_contents (value);
+@@ -612,14 +656,15 @@ collectRTCStats (std::map <std::string, std::shared_ptr<Stats>>
+     }
+ 
+     collectRTCRTPStreamStats (statsReport, timestampMillis,
+-                              gst_value_get_structure (value) );
++        gst_value_get_structure (value));
+   }
+ }
+ 
+ void
+-BaseRtpEndpointImpl::collectEndpointStats (std::map
+-    <std::string, std::shared_ptr<Stats>>
+-    &statsReport, std::string id, const GstStructure *e_stats,
++BaseRtpEndpointImpl::collectEndpointStats (
++    std::map<std::string, std::shared_ptr<Stats>> &statsReport,
++    std::string id,
++    const GstStructure *e_stats,
+     int64_t timestampMillis)
+ {
+   std::shared_ptr<Stats> endpointStats;
+@@ -629,23 +674,23 @@ BaseRtpEndpointImpl::collectEndpointStats (std::map
+   std::vector<std::shared_ptr<MediaLatencyStat>> e2eStats;
+ 
+   if (gst_structure_get (e_stats, "e2e-latencies", GST_TYPE_STRUCTURE,
+-                         &e2e_stats, NULL) ) {
++          &e2e_stats, NULL)) {
+     collectLatencyStats (e2eStats, e2e_stats);
+     gst_structure_free (e2e_stats);
+   }
+ 
+-  endpointStats = std::make_shared <EndpointStats> (id,
+-                  std::make_shared <StatsType> (StatsType::endpoint),
+-                  timestampMillis, inputStats, e2eStats);
++  endpointStats = std::make_shared<EndpointStats> (id,
++      std::make_shared<StatsType> (StatsType::endpoint), timestampMillis,
++      inputStats, e2eStats);
+ 
+   statsReport[id] = endpointStats;
+ }
+ 
+ void
+-BaseRtpEndpointImpl::fillStatsReport (std::map
+-                                      <std::string, std::shared_ptr<Stats>>
+-                                      &report, const GstStructure *stats,
+-                                      int64_t timestampMillis)
++BaseRtpEndpointImpl::fillStatsReport (
++    std::map<std::string, std::shared_ptr<Stats>> &report,
++    const GstStructure *stats,
++    int64_t timestampMillis)
+ {
+   const GstStructure *e_stats, *rtc_stats;
+ 
+@@ -658,7 +703,7 @@ BaseRtpEndpointImpl::fillStatsReport (std::map
+   rtc_stats = kms_utils_get_structure_by_name (stats, KMS_RTC_STATISTICS_FIELD);
+ 
+   if (rtc_stats != nullptr) {
+-    collectRTCStats (report, timestampMillis, rtc_stats );
++    collectRTCStats (report, timestampMillis, rtc_stats);
+   }
+ 
+   SdpEndpointImpl::fillStatsReport (report, stats, timestampMillis);
+@@ -666,10 +711,10 @@ BaseRtpEndpointImpl::fillStatsReport (std::map
+ 
+ BaseRtpEndpointImpl::StaticConstructor BaseRtpEndpointImpl::staticConstructor;
+ 
+-BaseRtpEndpointImpl::StaticConstructor::StaticConstructor()
++BaseRtpEndpointImpl::StaticConstructor::StaticConstructor ()
+ {
+   GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, GST_DEFAULT_NAME, 0,
+-                           GST_DEFAULT_NAME);
++      GST_DEFAULT_NAME);
+ }
+ 
+-} /* kurento */
++} // namespace kurento
+diff --git a/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.hpp b/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.hpp
+index 8618e3f84..037368f19 100644
+--- a/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.hpp
++++ b/server/module-core/src/server/implementation/objects/BaseRtpEndpointImpl.hpp
+@@ -26,26 +26,26 @@
+ namespace kurento
+ {
+ class BaseRtpEndpointImpl;
+-} /* kurento */
++} // namespace kurento
+ 
+ namespace kurento
+ {
+ void Serialize (std::shared_ptr<kurento::BaseRtpEndpointImpl> &object,
+-                JsonSerializer &serializer);
+-} /* kurento */
++    JsonSerializer &serializer);
++} // namespace kurento
+ 
+ namespace kurento
+ {
+ 
+ class BaseRtpEndpointImpl : public SdpEndpointImpl,
+-  public virtual BaseRtpEndpoint
++                            public virtual BaseRtpEndpoint
+ {
+ 
+ public:
+-
+   BaseRtpEndpointImpl (const boost::property_tree::ptree &config,
+-                       std::shared_ptr< MediaObjectImpl > parent,
+-                       const std::string &factoryName, bool useIpv6 = false);
++      std::shared_ptr<MediaObjectImpl> parent,
++      const std::string &factoryName,
++      bool useIpv6 = false);
+ 
+   virtual ~BaseRtpEndpointImpl ();
+ 
+@@ -71,48 +71,57 @@ public:
+ 
+   sigc::signal<void, MediaStateChanged> signalMediaStateChanged;
+   sigc::signal<void, ConnectionStateChanged> signalConnectionStateChanged;
++  sigc::signal<void, DtmfEventDetected> signalDtmfEventDetected;
+ 
+   /* Next methods are automatically implemented by code generator */
+   using SdpEndpointImpl::connect;
+   virtual bool connect (const std::string &eventType,
+-                        std::shared_ptr<EventHandler> handler) override;
++      std::shared_ptr<EventHandler> handler) override;
+   virtual void invoke (std::shared_ptr<MediaObjectImpl> obj,
+-                       const std::string &methodName, const Json::Value &params,
+-                       Json::Value &response) override;
++      const std::string &methodName,
++      const Json::Value &params,
++      Json::Value &response) override;
+ 
+   virtual void Serialize (JsonSerializer &serializer) override;
+ 
+ protected:
+   virtual void postConstructor () override;
+-  virtual void fillStatsReport (std::map <std::string, std::shared_ptr<Stats>>
+-                                &report, const GstStructure *stats,
+-                                int64_t timestampMillis) override;
++  virtual void fillStatsReport (
++      std::map<std::string, std::shared_ptr<Stats>> &report,
++      const GstStructure *stats,
++      int64_t timestampMillis) override;
+ 
+ private:
+-
+   std::string formatGstStructure (const GstStructure *stats);
+   std::shared_ptr<MediaState> current_media_state;
+   gulong mediaStateChangedHandlerId;
+   std::shared_ptr<ConnectionState> current_conn_state;
+   gulong connStateChangedHandlerId;
+   std::recursive_mutex mutex;
++  gulong dtmfEventDetectedHandlerId;
+ 
+   void updateMediaState (guint new_state);
+   void updateConnectionState (gchar *sessId, guint new_state);
+-
+-  void collectEndpointStats (std::map <std::string, std::shared_ptr<Stats>>
+-                             &statsReport, std::string id, const GstStructure *stats,
+-                             int64_t timestampMillis);
++  void onDtmfEventDetected (gint number,
++      gboolean end,
++      gint volume,
++      gint duration,
++      const gchar *mediaType);
++
++  void collectEndpointStats (
++      std::map<std::string, std::shared_ptr<Stats>> &statsReport,
++      std::string id,
++      const GstStructure *stats,
++      int64_t timestampMillis);
+   class StaticConstructor
+   {
+   public:
+-    StaticConstructor();
++    StaticConstructor ();
+   };
+ 
+   static StaticConstructor staticConstructor;
+-
+ };
+ 
+-} /* kurento */
++} // namespace kurento
+ 
+ #endif /*  __BASE_RTP_ENDPOINT_IMPL_HPP__ */
+diff --git a/server/module-core/src/server/interface/core.kmd.json b/server/module-core/src/server/interface/core.kmd.json
+index 59f99c7b9..314591764 100644
+--- a/server/module-core/src/server/interface/core.kmd.json
++++ b/server/module-core/src/server/interface/core.kmd.json
+@@ -1052,7 +1052,8 @@ Pipeline, towards the associated producer. Only valid for video consumers.
+       ],
+       "events": [
+         "MediaStateChanged",
+-        "ConnectionStateChanged"
++        "ConnectionStateChanged",
++        "DtmfEventDetected"
+       ]
+     },
+     {
+@@ -2718,6 +2719,38 @@ and is ready for establishing a connection.
+         }
+       ]
+     },
++    {
++      "name": "DtmfEventDetected",
++      "extends": "Media",
++      "doc": "Fired when a DTMF event is detected in the RTP stream",
++      "properties": [
++        {
++          "name": "number",
++          "doc": "The DTMF digit/number detected (0-15, where 10=*, 11=#, 12-15=A-D)",
++          "type": "int"
++        },
++        {
++          "name": "end", 
++          "doc": "True if this marks the end of the DTMF tone, false for start",
++          "type": "boolean"
++        },
++        {
++          "name": "volume",
++          "doc": "Volume level of the DTMF tone (0-63, lower values = higher volume)", 
++          "type": "int"
++        },
++        {
++          "name": "duration",
++          "doc": "Duration of the DTMF tone in timestamp units",
++          "type": "int"
++        },
++        {
++          "name": "mediaType",
++          "doc": "Media type where DTMF was detected (typically 'audio')",
++          "type": "String"
++        }
++      ]
++    },
+     {
+       "name": "MediaFlowOutStateChanged",
+       "extends": "Media",
