@@ -1,6 +1,6 @@
 {
   "name": "core",
-  "version": "7.2.1-dev",
+  "version": "7.2.2-dev",
   "code": {
     "kmd": {
       "java": {
@@ -1052,7 +1052,8 @@ Pipeline, towards the associated producer. Only valid for video consumers.
       ],
       "events": [
         "MediaStateChanged",
-        "ConnectionStateChanged"
+        "ConnectionStateChanged",
+        "DtmfEventDetected"
       ]
     },
     {
@@ -2715,6 +2716,38 @@ and is ready for establishing a connection.
           "name": "newState",
           "doc": "The new state",
           "type": "ConnectionState"
+        }
+      ]
+    },
+    {
+      "name": "DtmfEventDetected",
+      "extends": "Media",
+      "doc": "Fired when a DTMF event is detected in the RTP stream",
+      "properties": [
+        {
+          "name": "number",
+          "doc": "The DTMF digit/number detected (0-15, where 10=*, 11=#, 12-15=A-D)",
+          "type": "int"
+        },
+        {
+          "name": "end", 
+          "doc": "True if this marks the end of the DTMF tone, false for start",
+          "type": "boolean"
+        },
+        {
+          "name": "volume",
+          "doc": "Volume level of the DTMF tone (0-63, lower values = higher volume)", 
+          "type": "int"
+        },
+        {
+          "name": "duration",
+          "doc": "Duration of the DTMF tone in timestamp units",
+          "type": "int"
+        },
+        {
+          "name": "mediaType",
+          "doc": "Media type where DTMF was detected (typically 'audio')",
+          "type": "String"
         }
       ]
     },

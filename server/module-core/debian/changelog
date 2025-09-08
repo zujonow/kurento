@@ -1,7 +1,14 @@
-kurento-module-core (7.2.1-1kurento1) UNRELEASED; urgency=medium
+kurento-module-core (7.2.2-1kurento1) UNRELEASED; urgency=medium
 
   [ Kurento ]
   * UNRELEASED
+
+ -- pankaj <pantherpatel1980@gmail.com>  Mon, 01 Sep 2025 07:04:38 +0000
+
+kurento-module-core (7.2.1-1kurento1) testing; urgency=medium
+
+  [ Kurento ]
+  * testing
 
  -- Saul Pablo Labajo Izquierdo <slabajo@naevatec.com>  Wed, 19 Mar 2025 19:30:36 +0000
 

@@ -84,7 +84,9 @@ gboolean kms_sdp_session_process_answer (KmsSdpSession * self, GstSDPMessage * a
 GstSDPMessage * kms_sdp_session_get_local_sdp (KmsSdpSession * self);
 GstSDPMessage * kms_sdp_session_get_remote_sdp (KmsSdpSession * self);
 void kms_sdp_session_set_use_ipv6 (KmsSdpSession * self, gboolean use_ipv6);
+void kms_sdp_session_set_listen_dtmf (KmsSdpSession * self, gboolean listen_dtmf);
 gboolean kms_sdp_session_get_use_ipv6 (KmsSdpSession * self);
+gboolean kms_sdp_session_get_listen_dtmf (KmsSdpSession * self);
 void kms_sdp_session_set_addr (KmsSdpSession *self, const gchar * addr);
 
 G_END_DECLS

@@ -30,7 +30,7 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 G_DEFINE_TYPE (KmsSdpSession, kms_sdp_session, GST_TYPE_BIN);
 
 KmsSdpSession *
-kms_sdp_session_new (KmsBaseSdpEndpoint * ep, guint id)
+kms_sdp_session_new (KmsBaseSdpEndpoint *ep, guint id)
 {
   GObject *obj;
   KmsSdpSession *self;
@@ -44,7 +44,7 @@ kms_sdp_session_new (KmsBaseSdpEndpoint * ep, guint id)
 }
 
 GstSDPMessage *
-kms_sdp_session_generate_offer (KmsSdpSession * self)
+kms_sdp_session_generate_offer (KmsSdpSession *self)
 {
   GstSDPMessage *offer = NULL;
   GError *err = NULL;
@@ -85,7 +85,7 @@ error:
 }
 
 GstSDPMessage *
-kms_sdp_session_process_offer (KmsSdpSession * self, GstSDPMessage * offer)
+kms_sdp_session_process_offer (KmsSdpSession *self, GstSDPMessage *offer)
 {
   GstSDPMessage *answer = NULL, *copy;
   GError *err = NULL;
@@ -154,7 +154,7 @@ error:
 }
 
 gboolean
-kms_sdp_session_process_answer (KmsSdpSession * self, GstSDPMessage * answer)
+kms_sdp_session_process_answer (KmsSdpSession *self, GstSDPMessage *answer)
 {
   GstSDPMessage *copy;
   GError *err = NULL;
@@ -195,7 +195,7 @@ kms_sdp_session_process_answer (KmsSdpSession * self, GstSDPMessage * answer)
 }
 
 GstSDPMessage *
-kms_sdp_session_get_local_sdp (KmsSdpSession * self)
+kms_sdp_session_get_local_sdp (KmsSdpSession *self)
 {
   GstSDPMessage *sdp = NULL;
 
@@ -209,7 +209,7 @@ kms_sdp_session_get_local_sdp (KmsSdpSession * self)
 }
 
 GstSDPMessage *
-kms_sdp_session_get_remote_sdp (KmsSdpSession * self)
+kms_sdp_session_get_remote_sdp (KmsSdpSession *self)
 {
   GstSDPMessage *sdp = NULL;
 
@@ -223,13 +223,19 @@ kms_sdp_session_get_remote_sdp (KmsSdpSession * self)
 }
 
 void
-kms_sdp_session_set_use_ipv6 (KmsSdpSession * self, gboolean use_ipv6)
+kms_sdp_session_set_use_ipv6 (KmsSdpSession *self, gboolean use_ipv6)
 {
   g_object_set (self->agent, "use-ipv6", use_ipv6, NULL);
 }
 
+void
+kms_sdp_session_set_listen_dtmf (KmsSdpSession *self, gboolean listen_dtmf)
+{
+  g_object_set (self->agent, "listen-dtmf", listen_dtmf, NULL);
+}
+
 gboolean
-kms_sdp_session_get_use_ipv6 (KmsSdpSession * self)
+kms_sdp_session_get_use_ipv6 (KmsSdpSession *self)
 {
   gboolean ret;
 
@@ -238,14 +244,24 @@ kms_sdp_session_get_use_ipv6 (KmsSdpSession * self)
   return ret;
 }
 
+gboolean
+kms_sdp_session_get_listen_dtmf (KmsSdpSession *self)
+{
+  gboolean ret;
+
+  g_object_get (self->agent, "listen-dtmf", &ret, NULL);
+
+  return ret;
+}
+
 void
-kms_sdp_session_set_addr (KmsSdpSession * self, const gchar * addr)
+kms_sdp_session_set_addr (KmsSdpSession *self, const gchar *addr)
 {
   g_object_set (self->agent, "addr", addr, NULL);
 }
 
 static void
-kms_sdp_session_finalize (GObject * object)
+kms_sdp_session_finalize (GObject *object)
 {
   KmsSdpSession *self = KMS_SDP_SESSION (object);
 
@@ -274,7 +290,7 @@ kms_sdp_session_finalize (GObject * object)
 }
 
 static void
-kms_sdp_session_post_constructor (KmsSdpSession * self, KmsBaseSdpEndpoint * ep,
+kms_sdp_session_post_constructor (KmsSdpSession *self, KmsBaseSdpEndpoint *ep,
     guint id)
 {
   self->id = id;
@@ -283,7 +299,7 @@ kms_sdp_session_post_constructor (KmsSdpSession * self, KmsBaseSdpEndpoint * ep,
 }
 
 static void
-kms_sdp_session_init (KmsSdpSession * self)
+kms_sdp_session_init (KmsSdpSession *self)
 {
   g_rec_mutex_init (&self->mutex);
 
@@ -292,7 +308,7 @@ kms_sdp_session_init (KmsSdpSession * self)
 }
 
 static void
-kms_sdp_session_class_init (KmsSdpSessionClass * klass)
+kms_sdp_session_class_init (KmsSdpSessionClass *klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);

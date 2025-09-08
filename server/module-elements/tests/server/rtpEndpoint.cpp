@@ -52,7 +52,7 @@ BOOST_GLOBAL_FIXTURE (GF);
 GF::GF()
 {
   boost::property_tree::ptree ac, audioCodecs, vc, videoCodecs;
-  gst_init(nullptr, nullptr);
+  gst_init (nullptr, nullptr);
 
   moduleManager.loadModulesFromDirectories ("../../src/server:../../..");
 
@@ -79,13 +79,14 @@ GF::~GF()
 }
 
 static std::shared_ptr <RtpEndpointImpl>
-createRtpEndpoint (bool useIpv6)
+createRtpEndpoint (bool useIpv6, bool listenDtmf)
 {
   std::shared_ptr <kurento::MediaObjectImpl> rtpEndpoint;
   Json::Value constructorParams;
 
   constructorParams ["mediaPipeline"] = mediaPipelineId;
   constructorParams ["useIpv6"] = useIpv6;
+  constructorParams ["listenDtmf"] = listenDtmf;
 
   rtpEndpoint = moduleManager.getFactory ("RtpEndpoint")->createObject (
                   config, "",
@@ -103,7 +104,8 @@ releaseRtpEndpoint (std::shared_ptr<RtpEndpointImpl> &ep)
   MediaSet::getMediaSet ()->release (id);
 }
 
-static std::shared_ptr<MediaElementImpl> createTestSrc() {
+static std::shared_ptr<MediaElementImpl> createTestSrc()
+{
   std::shared_ptr <MediaElementImpl> src = std::dynamic_pointer_cast
       <MediaElementImpl> (MediaSet::getMediaSet()->ref (new  MediaElementImpl (
                             boost::property_tree::ptree(),
@@ -125,15 +127,17 @@ releaseTestSrc (std::shared_ptr<MediaElementImpl> &ep)
 }
 
 static void
-media_state_changes_impl (bool useIpv6)
+media_state_changes_impl (bool useIpv6, bool listenDtmf)
 {
   std::atomic<bool> media_state_changed (false);
   std::condition_variable cv;
   std::mutex mtx;
   std::unique_lock<std::mutex> lck (mtx);
 
-  std::shared_ptr <RtpEndpointImpl> rtpEpOfferer = createRtpEndpoint (useIpv6);
-  std::shared_ptr <RtpEndpointImpl> rtpEpAnswerer = createRtpEndpoint (useIpv6);
+  std::shared_ptr <RtpEndpointImpl> rtpEpOfferer = createRtpEndpoint (useIpv6,
+      listenDtmf);
+  std::shared_ptr <RtpEndpointImpl> rtpEpAnswerer = createRtpEndpoint (useIpv6,
+      listenDtmf);
   std::shared_ptr <MediaElementImpl> src = createTestSrc();
 
   src->connect (rtpEpOfferer);
@@ -184,10 +188,12 @@ media_state_changes_ipv6 ()
 #endif
 
 static void
-connection_state_changes_impl (bool useIpv6)
+connection_state_changes_impl (bool useIpv6, bool listenDtmf)
 {
-  std::shared_ptr <RtpEndpointImpl> rtpEpOfferer = createRtpEndpoint (useIpv6);
-  std::shared_ptr <RtpEndpointImpl> rtpEpAnswerer = createRtpEndpoint (useIpv6);
+  std::shared_ptr <RtpEndpointImpl> rtpEpOfferer = createRtpEndpoint (useIpv6,
+      listenDtmf);
+  std::shared_ptr <RtpEndpointImpl> rtpEpAnswerer = createRtpEndpoint (useIpv6,
+      listenDtmf);
   std::atomic<bool> conn_state_changed (false);
   std::condition_variable cv;
   std::mutex mtx;
@@ -256,12 +262,12 @@ connection_state_changes_ipv6 ()
 #endif
 
 test_suite *
-init_unit_test_suite ( int , char *[] )
+init_unit_test_suite ( int, char *[] )
 {
   test_suite *test = BOOST_TEST_SUITE ( "RtpEndpoint" );
 
   // Prevents getting stuck for the default 4 minutes when IPv6 is not available.
-  MediaSet::setCollectorInterval(std::chrono::seconds (5));
+  MediaSet::setCollectorInterval (std::chrono::seconds (5) );
 
   test->add (BOOST_TEST_CASE ( &media_state_changes ), 0, /* timeout */ 15);
   test->add (BOOST_TEST_CASE ( &connection_state_changes ), 0, /* timeout */ 15);

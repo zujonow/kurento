@@ -26,13 +26,13 @@
 namespace kurento
 {
 class BaseRtpEndpointImpl;
-} /* kurento */
+} // namespace kurento
 
 namespace kurento
 {
 void Serialize (std::shared_ptr<kurento::BaseRtpEndpointImpl> &object,
                 JsonSerializer &serializer);
-} /* kurento */
+} // namespace kurento
 
 namespace kurento
 {
@@ -42,10 +42,12 @@ class BaseRtpEndpointImpl : public SdpEndpointImpl,
 {
 
 public:
-
   BaseRtpEndpointImpl (const boost::property_tree::ptree &config,
-                       std::shared_ptr< MediaObjectImpl > parent,
-                       const std::string &factoryName, bool useIpv6 = false);
+                       std::shared_ptr<MediaObjectImpl> parent,
+                       const std::string &factoryName,
+                       bool useIpv6 = false,
+                       bool listenDtmf = false
+                      );
 
   virtual ~BaseRtpEndpointImpl ();
 
@@ -71,48 +73,57 @@ public:
 
   sigc::signal<void, MediaStateChanged> signalMediaStateChanged;
   sigc::signal<void, ConnectionStateChanged> signalConnectionStateChanged;
+  sigc::signal<void, DtmfEventDetected> signalDtmfEventDetected;
 
   /* Next methods are automatically implemented by code generator */
   using SdpEndpointImpl::connect;
   virtual bool connect (const std::string &eventType,
                         std::shared_ptr<EventHandler> handler) override;
   virtual void invoke (std::shared_ptr<MediaObjectImpl> obj,
-                       const std::string &methodName, const Json::Value &params,
+                       const std::string &methodName,
+                       const Json::Value &params,
                        Json::Value &response) override;
 
   virtual void Serialize (JsonSerializer &serializer) override;
 
 protected:
   virtual void postConstructor () override;
-  virtual void fillStatsReport (std::map <std::string, std::shared_ptr<Stats>>
-                                &report, const GstStructure *stats,
-                                int64_t timestampMillis) override;
+  virtual void fillStatsReport (
+    std::map<std::string, std::shared_ptr<Stats>> &report,
+    const GstStructure *stats,
+    int64_t timestampMillis) override;
 
 private:
-
   std::string formatGstStructure (const GstStructure *stats);
   std::shared_ptr<MediaState> current_media_state;
   gulong mediaStateChangedHandlerId;
   std::shared_ptr<ConnectionState> current_conn_state;
   gulong connStateChangedHandlerId;
   std::recursive_mutex mutex;
+  gulong dtmfEventDetectedHandlerId;
 
   void updateMediaState (guint new_state);
   void updateConnectionState (gchar *sessId, guint new_state);
+  void onDtmfEventDetected (gint number,
+                            gboolean end,
+                            gint volume,
+                            gint duration,
+                            const gchar *mediaType);
 
-  void collectEndpointStats (std::map <std::string, std::shared_ptr<Stats>>
-                             &statsReport, std::string id, const GstStructure *stats,
-                             int64_t timestampMillis);
+  void collectEndpointStats (
+    std::map<std::string, std::shared_ptr<Stats>> &statsReport,
+    std::string id,
+    const GstStructure *stats,
+    int64_t timestampMillis);
   class StaticConstructor
   {
   public:
-    StaticConstructor();
+    StaticConstructor ();
   };
 
   static StaticConstructor staticConstructor;
-
 };
 
-} /* kurento */
+} // namespace kurento
 
 #endif /*  __BASE_RTP_ENDPOINT_IMPL_HPP__ */

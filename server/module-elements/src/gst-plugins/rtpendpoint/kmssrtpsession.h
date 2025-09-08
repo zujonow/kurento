@@ -47,6 +47,7 @@ struct _KmsSrtpSession
   KmsBaseRtpSession parent;
 
   gboolean use_ipv6;
+  gboolean listen_dtmf;
 };
 
 struct _KmsSrtpSessionClass
@@ -57,12 +58,12 @@ struct _KmsSrtpSessionClass
   /* virtual methods */
   void (*post_constructor) (KmsSrtpSession * self, KmsBaseSdpEndpoint * ep,
                             guint id, KmsIRtpSessionManager * manager,
-                            gboolean use_ipv6);
+                            gboolean use_ipv6, gboolean listen_dtmf);
 };
 
 GType kms_srtp_session_get_type (void);
 
-KmsSrtpSession *kms_srtp_session_new (KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager, gboolean use_ipv6);
+KmsSrtpSession *kms_srtp_session_new (KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager, gboolean use_ipv6, gboolean listen_dtmf);
 
 KmsRtpBaseConnection * kms_srtp_session_get_connection (KmsSrtpSession * self, KmsSdpMediaHandler * handler);
 
