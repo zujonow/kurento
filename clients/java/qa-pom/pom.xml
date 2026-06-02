@@ -5,7 +5,7 @@
 	<!-- Maven coordinates -->
 	<groupId>org.kurento</groupId>
 	<artifactId>kurento-qa-pom</artifactId>
-	<version>7.2.1-SNAPSHOT</version>
+	<version>7.3.1-SNAPSHOT</version>
 	<packaging>pom</packaging>
 
 	<!-- Project-level information -->
@@ -63,15 +63,15 @@
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
 		<!-- maven-compiler-plugin -->
-		<maven.compiler.release>11</maven.compiler.release>
+		<maven.compiler.release>17</maven.compiler.release>
 
 		<!-- maven-eclipse-plugin -->
 		<downloadSources>true</downloadSources>
 		<downloadJavadocs>true</downloadJavadocs>
 
-		<version.checkstyle.plugin>2.17</version.checkstyle.plugin>
-		<version.findbugs.plugin>3.0.4</version.findbugs.plugin>
-		<version.puppycrawl.checkstyle>8.29</version.puppycrawl.checkstyle>
+		<version.checkstyle.plugin>3.6.0</version.checkstyle.plugin>
+		<version.findbugs.plugin>3.0.5</version.findbugs.plugin>
+		<version.puppycrawl.checkstyle>12.1.1</version.puppycrawl.checkstyle>
 		<version.eclipse.plugin>2.10</version.eclipse.plugin>
 	</properties>
 

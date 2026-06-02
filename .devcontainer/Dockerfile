@@ -35,22 +35,28 @@ RUN apt update && apt install -y --no-install-recommends \
 
 RUN apt install -y devscripts git-buildpackage equivs
 
-RUN wget https://download.java.net/java/GA/jdk22.0.1/c7ec1332f7bb44aeba2eb341ae18aca4/8/GPL/openjdk-22.0.1_linux-x64_bin.tar.gz
+RUN apt update && apt install -y openjdk-25-jdk
 
-RUN tar xvf openjdk-22.0.1_linux-x64_bin.tar.gz
 
-RUN mv jdk-22.0.1 /usr/lib/jvm
+# Maven 3.9.x is required and ubuntu noble only provide 3.8.7
+ENV MAVEN_VERSION=3.9.11
+ENV MAVEN_HOME=/usr/share/maven
+ENV PATH=$MAVEN_HOME/bin:$PATH
+RUN wget -q https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz -C /opt && \
+    mv ${MAVEN_HOME} ${MAVEN_HOME}_orig && \
+    ln -s /opt/apache-maven-${MAVEN_VERSION} $MAVEN_HOME && \
+    rm apache-maven-${MAVEN_VERSION}-bin.tar.gz
+RUN mvn -v
 
-RUN update-alternatives --install /usr/bin/javac javac /usr/lib/jvm/jdk-22.0.1/bin/javac 2211
-RUN update-alternatives --install /usr/bin/java java /usr/lib/jvm/jdk-22.0.1/bin/java 2211
-
-RUN rm openjdk-22.0.1_linux-x64_bin.tar.gz
-
-RUN curl -sL https://deb.nodesource.com/setup_18.x | bash -
+RUN curl -sL https://deb.nodesource.com/setup_24.x | bash -
 
 RUN apt install -y nodejs
 
 RUN node --dns-result-order=ipv4first /usr/bin/npm  install -g bower
+
+RUN apt update && \
+    apt install -y xmlstarlet indent astyle
 
 
 # Ensure sudo group users are not 

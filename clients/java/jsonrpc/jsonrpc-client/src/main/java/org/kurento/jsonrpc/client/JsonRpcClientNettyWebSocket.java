@@ -17,9 +17,11 @@
 package org.kurento.jsonrpc.client;
 
 import java.io.IOException;
+import java.nio.channels.spi.SelectorProvider;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.Future;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -39,8 +41,10 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.DefaultSelectStrategyFactory;
 import io.netty.channel.EventLoopGroup;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
@@ -62,6 +66,7 @@ import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.CharsetUtil;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
 
 public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket {
 
@@ -164,15 +169,24 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
   private volatile Channel channel;
   private volatile EventLoopGroup group;
   private volatile JsonRpcWebSocketClientHandler handler;
+  private final SslContext customSslContext;
 
-  public JsonRpcClientNettyWebSocket(String url) {
-    this(url, null);
-  }
+    public JsonRpcClientNettyWebSocket(String url) {
+        this(url, null, null);
+    }
 
-  public JsonRpcClientNettyWebSocket(String url, JsonRpcWSConnectionListener connectionListener) {
-    super(url, connectionListener);
-    log.debug("{} Creating JsonRPC NETTY Websocket client", label);
-  }
+    public JsonRpcClientNettyWebSocket(String url,
+                                       JsonRpcWSConnectionListener connectionListener) {
+        this(url, connectionListener, null);
+    }
+
+    public JsonRpcClientNettyWebSocket(String url,
+                                       JsonRpcWSConnectionListener connectionListener,
+                                       SslContext sslContext) {
+        super(url, connectionListener);
+        this.customSslContext = sslContext;
+        log.debug("{} Creating JsonRPC NETTY Websocket client (mTLS-capable)", label);
+    }
 
   public void waitForChannelWritability() throws InterruptedException, KurentoException {
     lock.lock();
@@ -240,8 +254,12 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
       final boolean ssl = "wss".equalsIgnoreCase(this.uri.getScheme());
       final SslContext sslCtx;
       try {
-        sslCtx = ssl ? SslContextBuilder.forClient()
-            .trustManager(InsecureTrustManagerFactory.INSTANCE).build() : null;
+        if (ssl) {
+          sslCtx = customSslContext != null ? customSslContext :
+              SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+        } else {
+          sslCtx = null;
+        }
       } catch (SSLException e) {
         log.error("{} Could not create SSL Context", label, e);
         throw new IllegalArgumentException(
@@ -264,8 +282,9 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
       }
 
       if (group == null || group.isShuttingDown() || group.isShutdown() || group.isTerminated()) {
-        log.info("{} Creating new NioEventLoopGroup", label);
-        group = new NioEventLoopGroup();
+        log.info("{} Creating new native event loop", label);
+        group = new MultiThreadIoEventLoopGroup(0, (Executor) null,
+            NioIoHandler.newFactory(SelectorProvider.provider(), DefaultSelectStrategyFactory.INSTANCE));
       }
 
       if (channel != null) {
@@ -289,7 +308,7 @@ public class JsonRpcClientNettyWebSocket extends AbstractJsonRpcClientWebSocket 
                 p.addLast(sslCtx.newHandler(ch.alloc(), host, port));
               }
               p.addLast(new HttpClientCodec(), new HttpObjectAggregator(8192),
-                  WebSocketClientCompressionHandler.INSTANCE, handler);
+                  new WebSocketClientCompressionHandler(0), handler);
             }
           }).option(ChannelOption.CONNECT_TIMEOUT_MILLIS, this.connectionTimeout);
 

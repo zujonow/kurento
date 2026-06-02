@@ -1211,9 +1211,11 @@ kms_base_rtp_endpoint_get_caps_from_rtpmap (const gchar *media,
     return NULL;
   }
 
-  caps = gst_caps_new_simple ("application/x-rtp", "media", G_TYPE_STRING,
-      media, "payload", G_TYPE_INT, atoi (pt), "clock-rate", G_TYPE_INT,
-      clock_rate, "encoding-name", G_TYPE_STRING,
+  caps = gst_caps_new_simple ("application/x-rtp",
+      "media", G_TYPE_STRING, media,
+      "payload", G_TYPE_INT, (gint)strtol(pt, NULL, 10),
+      "clock-rate", G_TYPE_INT, clock_rate,
+      "encoding-name", G_TYPE_STRING,
       kms_utils_get_caps_codec_name_from_sdp (codec_name), NULL);
 
   g_free (codec_name);
@@ -1848,7 +1850,7 @@ kms_base_rtp_endpoint_get_caps_for_pt (KmsBaseRtpEndpoint *self, guint pt)
       GstCaps *caps;
       const gchar *payload = gst_sdp_media_get_format (media, j);
 
-      if (atoi (payload) != pt) {
+      if ((gint)strtol(payload, NULL, 10) != pt) {
         continue;
       }
 

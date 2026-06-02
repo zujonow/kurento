@@ -60,13 +60,13 @@
 
 # Global arguments for FROM.
 ARG UBUNTU_CODENAME="noble"
-
+ARG TARGETPLATFORM
 
 
 # Stage: Base system configuration
 # ================================
 
-FROM ubuntu:${UBUNTU_CODENAME} AS ubuntu_base
+FROM --platform=$TARGETPLATFORM ubuntu:${UBUNTU_CODENAME} AS ubuntu_base
 
 ARG APT_ARGS=""
 
@@ -106,13 +106,15 @@ apt-get $APT_ARGS update && apt-get $APT_ARGS install --no-install-recommends --
 
 # Add Kurento repository key for apt-get.
 RUN \
-apt-key adv \
+gpg -k && \
+gpg --no-default-keyring \
+    --keyring /etc/apt/keyrings/kurento.gpg \
     --keyserver hkp://keyserver.ubuntu.com:80 \
     --recv-keys 234821A61B67740F89BFD669FC8A16625AFA7A83
 
 # Add Kurento repository line for apt-get.
 RUN \
-echo "deb [arch=amd64] http://ubuntu.openvidu.io/$KMS_VERSION $UBUNTU_CODENAME main" \
+echo "deb [signed-by=/etc/apt/keyrings/kurento.gpg] http://ubuntu.openvidu.io/$KMS_VERSION $UBUNTU_CODENAME main" \
     >/etc/apt/sources.list.d/kurento.list
 
 # Install GStremer Rust rtp plugins (custom build for kurento, needed for AV1 RTP support)
@@ -136,7 +138,8 @@ apt-get $APT_ARGS update \
     kurento-module-datachannelexample \
     kurento-module-markerdetector \
     kurento-module-platedetector \
-    kurento-module-pointerdetector ; \
+    kurento-module-pointerdetector \
+    kurento-module-videosampler ; \
 do \
     apt-get $APT_ARGS install --no-install-recommends --yes "$PACKAGE" || true ; \
 done \
