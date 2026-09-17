@@ -204,6 +204,78 @@ ext_data_new ()
   return edata;
 }
 
+/* RtpBin receive branches begin */
+
+/* One branch per rtpbin "recv_rtp_src_<session>_<ssrc>_<pt>" pad.
+ *
+ * rtpbin creates one such pad per remote SSRC. A remote that changes its
+ * SSRC mid-session (common with Asterisk, which does it on bridge joins and
+ * transfers, without any accompanying signalling) therefore produces a
+ * second pad for the same media. Only one branch at a time can feed the
+ * single always-sink pad of the media's agnosticbin, so a new SSRC replaces
+ * the previous branch instead of being left dangling: an unlinked rtpbin pad
+ * makes upstream fail with GST_FLOW_NOT_LINKED, which kills the pipeline.
+ */
+typedef enum
+{
+  KMS_RECV_BRANCH_DEPAYLOADER,  /* depayloader -> agnosticbin; the linked one */
+  KMS_RECV_BRANCH_DTMF,         /* fakesink, telephone-event */
+  KMS_RECV_BRANCH_FAKE,         /* fakesink, no depayloader available */
+} KmsRecvBranchType;
+
+typedef struct _KmsRecvBranch
+{
+  KmsRecvBranchType type;
+  KmsMediaType media;
+  guint ssrc;                   /* parsed from the pad name; 0 if unknown */
+  gchar *pad_name;              /* owned; also the hash table key */
+  GstPad *rtpbin_pad;           /* owned ref */
+  GstElement *element;          /* owned ref: depayloader or fakesink */
+  gboolean detached;            /* TRUE once unlinked from the pipeline */
+  gulong drop_probe_id;         /* probe that swallows late data, 0 if none */
+} KmsRecvBranch;
+
+static KmsRecvBranch *
+kms_recv_branch_new (KmsRecvBranchType type, KmsMediaType media, guint ssrc,
+    GstPad *pad, GstElement *element)
+{
+  KmsRecvBranch *branch = g_slice_new0 (KmsRecvBranch);
+
+  branch->type = type;
+  branch->media = media;
+  branch->ssrc = ssrc;
+  branch->pad_name = g_strdup (GST_OBJECT_NAME (pad));
+  branch->rtpbin_pad = gst_object_ref (pad);
+  branch->element = gst_object_ref (element);
+
+  return branch;
+}
+
+/* Drops references only. It must not change element state nor touch the bin:
+ * it also runs from dispose(), where GstBin still owns the elements and is
+ * about to tear them down itself.
+ */
+static void
+kms_recv_branch_destroy (KmsRecvBranch *branch)
+{
+  if (branch == NULL) {
+    return;
+  }
+
+  if (branch->drop_probe_id != 0 && branch->rtpbin_pad != NULL) {
+    gst_pad_remove_probe (branch->rtpbin_pad, branch->drop_probe_id);
+    branch->drop_probe_id = 0;
+  }
+
+  g_clear_pointer (&branch->rtpbin_pad, gst_object_unref);
+  g_clear_pointer (&branch->element, gst_object_unref);
+  g_free (branch->pad_name);
+
+  g_slice_free (KmsRecvBranch, branch);
+}
+
+/* RtpBin receive branches end */
+
 struct _KmsBaseRtpEndpointPrivate
 {
   KmsBaseRtpSession *sess;
@@ -219,6 +291,23 @@ struct _KmsBaseRtpEndpointPrivate
 
   RtpMediaConfig *audio_config;
   RtpMediaConfig *video_config;
+
+  /* RtpBin receive branches.
+   * recv_branches: pad name (gchar*, owned by the branch) -> KmsRecvBranch*.
+   * audio_recv/video_recv are non-owning pointers into it: the branch
+   * currently feeding the corresponding agnosticbin, or NULL.
+   * All three are protected by KMS_ELEMENT_LOCK. */
+  GHashTable *recv_branches;
+  KmsRecvBranch *audio_recv;
+  KmsRecvBranch *video_recv;
+
+  /* Detached branches are disposed here. Never set an element to GST_STATE_NULL
+   * from a streaming thread; see kms_base_rtp_endpoint_detach_branch(). */
+  GThreadPool *remove_pool;
+
+  /* Keeps depayloader output PTS increasing across an SSRC change. */
+  KmsPtsTracker *audio_pts;
+  KmsPtsTracker *video_pts;
 
   guint min_video_recv_bw;
   guint min_video_send_bw;
@@ -1333,7 +1422,8 @@ end:
 }
 
 static GstElement *
-kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps *caps)
+kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps *caps,
+    KmsPtsTracker *pts)
 {
   GstElementFactory *factory;
   GstElement *depayloader = NULL;
@@ -1366,7 +1456,7 @@ kms_base_rtp_endpoint_get_depayloader_for_caps (GstCaps *caps)
     depayloader = gst_element_factory_create (factory, NULL);
 
     if (depayloader != NULL) {
-      kms_utils_depayloader_monitor_pts_out (depayloader);
+      kms_utils_depayloader_monitor_pts_out_tracked (depayloader, pts);
       break;
     }
   }
@@ -2034,113 +2124,422 @@ is_dtmf_caps (GstCaps *caps)
 //   g_print ("Pankaj Set up DTMF message handler\n");
 // }
 
+/* Parses the SSRC out of an rtpbin "recv_rtp_src_<session>_<ssrc>_<pt>" pad
+ * name. Returns 0 if the name does not have that shape. */
+static guint
+kms_base_rtp_endpoint_ssrc_from_pad_name (const gchar *pad_name)
+{
+  const gchar *p = pad_name;
+  guint underscores = 0;
+  guint64 ssrc;
+  gchar *end = NULL;
+
+  while (*p != '\0' && underscores < 4) {
+    if (*p == '_') {
+      underscores++;
+    }
+    p++;
+  }
+
+  if (underscores < 4) {
+    GST_WARNING ("Cannot parse SSRC from pad name '%s'", pad_name);
+    return 0;
+  }
+
+  ssrc = g_ascii_strtoull (p, &end, 10);
+
+  if (end == p || *end != '_' || ssrc > G_MAXUINT32) {
+    GST_WARNING ("Cannot parse SSRC from pad name '%s'", pad_name);
+    return 0;
+  }
+
+  return (guint) ssrc;
+}
+
+static GstPadProbeReturn
+kms_base_rtp_endpoint_drop_probe (GstPad *pad, GstPadProbeInfo *info,
+    gpointer user_data)
+{
+  return GST_PAD_PROBE_DROP;
+}
+
+/* Disposes of an element away from any streaming thread. Ordering follows
+ * remove_on_unlinked_async() in kmsagnosticbin.c: remove from the bin while
+ * still PAUSED, then go to NULL. Consumes the reference it is given. */
+static void
+kms_base_rtp_endpoint_remove_element_async (gpointer data, gpointer user_data)
+{
+  GstElement *element = GST_ELEMENT_CAST (data);
+  GstObject *parent;
+
+  gst_element_set_locked_state (element, TRUE);
+
+  parent = gst_object_get_parent (GST_OBJECT (element));
+  if (parent != NULL) {
+    gst_bin_remove (GST_BIN (parent), element);
+    gst_object_unref (parent);
+  }
+
+  gst_element_set_state (element, GST_STATE_NULL);
+  gst_object_unref (element);
+}
+
+/* Drops the stats probe that kms_base_rtp_endpoint_update_stats() installed on
+ * this element's sink pad. Without this, every retired depayloader stays
+ * pinned -- with a live buffer probe -- until the endpoint is destroyed. */
+static void
+kms_base_rtp_endpoint_remove_stats_probe (KmsBaseRtpEndpoint *self,
+    GstElement *element)
+{
+  GstPad *pad;
+  GSList *l;
+
+  pad = gst_element_get_static_pad (element, "sink");
+  if (pad == NULL) {
+    return;
+  }
+
+  KMS_ELEMENT_LOCK (self);
+
+  for (l = self->priv->stats.probes; l != NULL; l = l->next) {
+    if (kms_stats_probe_watches (l->data, pad)) {
+      kms_stats_probe_destroy (l->data);
+      self->priv->stats.probes =
+          g_slist_delete_link (self->priv->stats.probes, l);
+      break;
+    }
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  gst_object_unref (pad);
+}
+
+/* Unlinks a branch's element on both sides and queues it for disposal.
+ *
+ * Both unlinks have to happen here and now. Leaving the downstream one to the
+ * worker thread's gst_bin_remove() would race the caller, which is about to
+ * link a replacement into the agnosticbin's single always-sink pad. */
+static void
+kms_base_rtp_endpoint_dispose_branch_element (KmsBaseRtpEndpoint *self,
+    KmsRecvBranch *branch)
+{
+  GstPad *src_pad, *sink_pad, *peer;
+
+  /* Whatever is still in flight inside the element must not reach a pad that
+   * is about to be unlinked: that would report GST_FLOW_NOT_LINKED back
+   * upstream and error out the pipeline. Returning DROP makes gst_pad_push()
+   * report GST_FLOW_OK instead. The probe needs no bookkeeping, as it goes
+   * away with the element. */
+  src_pad = gst_element_get_static_pad (branch->element, "src");
+  if (src_pad != NULL) {
+    gst_pad_add_probe (src_pad,
+        GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
+        | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+        kms_base_rtp_endpoint_drop_probe, NULL, NULL);
+  }
+
+  /* Upstream first, so no new data enters the element */
+  sink_pad = gst_element_get_static_pad (branch->element, "sink");
+  if (sink_pad != NULL) {
+    gst_pad_unlink (branch->rtpbin_pad, sink_pad);
+    gst_object_unref (sink_pad);
+  }
+
+  /* Then downstream. This one cannot be left to the worker thread's
+   * gst_bin_remove(): the caller is about to link a replacement into the
+   * agnosticbin's single always-sink pad, and would race it. */
+  if (src_pad != NULL) {
+    peer = gst_pad_get_peer (src_pad);
+    if (peer != NULL) {
+      gst_pad_unlink (src_pad, peer);
+      gst_object_unref (peer);
+    }
+    gst_object_unref (src_pad);
+  }
+
+  /* During dispose the pool is already gone; GstBin then disposes of the
+   * element itself when it tears down its children. */
+  if (self->priv->remove_pool != NULL) {
+    g_thread_pool_push (self->priv->remove_pool,
+        gst_object_ref (branch->element), NULL);
+  }
+}
+
+/* Takes a receive branch out of the pipeline. Idempotent, and safe to call
+ * from a streaming thread.
+ *
+ * Tearing the branch down synchronously is not an option here. Setting an
+ * element to GST_STATE_NULL deactivates its sink pad, which takes that pad's
+ * stream lock -- but the caller is rtpbin's session thread, which serves every
+ * SSRC of the session and may itself be blocked inside the agnosticbin. So:
+ * stop data reaching the branch with a drop probe, unlink it, and let a worker
+ * thread dispose of the element.
+ */
+static void
+kms_base_rtp_endpoint_detach_branch (KmsBaseRtpEndpoint *self,
+    KmsRecvBranch *branch)
+{
+  /* pad-removed and a switchover can both reach this for the same branch */
+  KMS_ELEMENT_LOCK (self);
+
+  if (branch->detached) {
+    KMS_ELEMENT_UNLOCK (self);
+    return;
+  }
+  branch->detached = TRUE;
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  GST_INFO_OBJECT (self, "Detach %s branch, SSRC: %u, pad: %s",
+      kms_utils_media_type_to_str (branch->media), branch->ssrc,
+      branch->pad_name);
+
+  /* Returning DROP for a buffer makes gst_pad_push() report GST_FLOW_OK
+   * upstream. That is what keeps the source alive should this SSRC resume: an
+   * unlinked pad reports GST_FLOW_NOT_LINKED instead, which takes the whole
+   * pipeline down with an "Internal data stream error". */
+  branch->drop_probe_id = gst_pad_add_probe (branch->rtpbin_pad,
+      GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
+      | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      kms_base_rtp_endpoint_drop_probe, NULL, NULL);
+
+  if (branch->type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_remove_stats_probe (self, branch->element);
+  }
+
+  kms_base_rtp_endpoint_dispose_branch_element (self, branch);
+}
+
+/* Last resort when a depayloader cannot be linked: the rtpbin pad must never
+ * be left unlinked, so feed it to a fakesink. This media is lost, but the
+ * endpoint survives and the next SSRC gets a clean attempt. */
+static void
+kms_base_rtp_endpoint_branch_fallback_to_fakesink (KmsBaseRtpEndpoint *self,
+    KmsRecvBranch *branch)
+{
+  GstElement *fakesink;
+  GstPad *sink_pad;
+
+  GST_WARNING_OBJECT (self, "Discarding %s SSRC %u: its depayloader could not"
+      " be linked", kms_utils_media_type_to_str (branch->media), branch->ssrc);
+
+  KMS_ELEMENT_LOCK (self);
+
+  if (self->priv->audio_recv == branch) {
+    self->priv->audio_recv = NULL;
+  }
+  if (self->priv->video_recv == branch) {
+    self->priv->video_recv = NULL;
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  /* Get rid of the depayloader that could not be linked. It may already be
+   * linked to the agnosticbin, if only the upstream link failed. */
+  kms_base_rtp_endpoint_remove_stats_probe (self, branch->element);
+  kms_base_rtp_endpoint_dispose_branch_element (self, branch);
+  gst_object_unref (branch->element);
+
+  fakesink = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
+  g_object_set (fakesink, "async", FALSE, "sync", FALSE, NULL);
+  gst_bin_add (GST_BIN (self), fakesink);
+  gst_element_sync_state_with_parent (fakesink);
+
+  branch->type = KMS_RECV_BRANCH_FAKE;
+  branch->element = gst_object_ref (fakesink);
+
+  sink_pad = gst_element_get_static_pad (fakesink, "sink");
+  if (sink_pad != NULL) {
+    if (gst_pad_link (branch->rtpbin_pad, sink_pad) != GST_PAD_LINK_OK) {
+      GST_ERROR_OBJECT (self, "Cannot link pad %s to a fakesink either",
+          branch->pad_name);
+    }
+    gst_object_unref (sink_pad);
+  }
+}
+
 static void
 kms_base_rtp_endpoint_rtpbin_pad_added (GstElement *rtpbin,
     GstPad *pad, KmsBaseRtpEndpoint *self)
 {
-  GstElement *agnostic, *depayloader;
-  gboolean added = TRUE;
+  GstElement *agnostic, *element;
+  KmsRecvBranch *branch, *old = NULL;
+  KmsRecvBranchType type;
+  KmsPtsTracker *pts;
   KmsMediaType media;
+  guint session, ssrc;
   GstCaps *caps;
+  gboolean linked = TRUE;
 
-  GST_PAD_STREAM_LOCK (pad);
-  caps = gst_pad_query_caps (pad, NULL);
-
+  /* Classify the pad. rtpbin names it "recv_rtp_src_<session>_<ssrc>_<pt>",
+   * so the prefix gives the media and the rest gives the SSRC. */
   if (g_str_has_prefix (GST_OBJECT_NAME (pad), AUDIO_RTPBIN_RECV_RTP_SRC)) {
     agnostic = kms_element_get_audio_agnosticbin (KMS_ELEMENT (self));
     media = KMS_MEDIA_TYPE_AUDIO;
+    session = AUDIO_RTP_SESSION;
+    pts = self->priv->audio_pts;
   } else if (g_str_has_prefix (GST_OBJECT_NAME (pad),
           VIDEO_RTPBIN_RECV_RTP_SRC)) {
     agnostic = kms_element_get_video_agnosticbin (KMS_ELEMENT (self));
     media = KMS_MEDIA_TYPE_VIDEO;
+    session = VIDEO_RTP_SESSION;
+    pts = self->priv->video_pts;
 
     if (self->priv->rl != NULL) {
+      /* Replacing this without destroying the old one leaks a manager, and
+       * a probe on a pad that is on its way out, for every new video SSRC. */
+      g_clear_pointer (&self->priv->rl->event_manager,
+          kms_utils_remb_event_manager_destroy);
       self->priv->rl->event_manager = kms_utils_remb_event_manager_create (pad);
     }
   } else {
-    added = FALSE;
-    goto end;
+    return;
   }
 
-  GST_DEBUG_OBJECT (self,
-      "New pad: %" GST_PTR_FORMAT " for linking to %" GST_PTR_FORMAT
-      " with caps %" GST_PTR_FORMAT, pad, agnostic, caps);
+  /* Held until the pad is linked. Without it the jitterbuffer task could
+   * start pushing on a pad that has no peer yet, and report NOT_LINKED. */
+  GST_PAD_STREAM_LOCK (pad);
 
-  /* Check if this is a DTMF stream */
+  ssrc = kms_base_rtp_endpoint_ssrc_from_pad_name (GST_OBJECT_NAME (pad));
+  caps = gst_pad_query_caps (pad, NULL);
 
+  GST_DEBUG_OBJECT (self, "New pad: %" GST_PTR_FORMAT ", SSRC: %u"
+      ", caps: %" GST_PTR_FORMAT, pad, ssrc, caps);
+
+  /* Build the element this pad will feed */
   if (is_dtmf_caps (caps)) {
-    GstElement *fakesink =
-        kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
-    GstPad *sink_pad;
-
-    g_object_set (fakesink, "async", FALSE, "sync", FALSE, NULL);
-    gst_bin_add (GST_BIN (self), fakesink);
-    gst_element_sync_state_with_parent (fakesink);
-
-    sink_pad = gst_element_get_static_pad (fakesink, "sink");
-    if (sink_pad != NULL) {
-      if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
-        GST_ERROR_OBJECT (self, "Failed to link DTMF pad to fakesink");
-      } else {
-        GST_INFO_OBJECT (self, "Linked DTMF pad %s directly to fakesink",
-            GST_OBJECT_NAME (pad));
-      }
-      gst_object_unref (sink_pad);
-    }
-
-    gst_caps_unref (caps);
-    // setup_dtmf_message_handler (fakesink);
-    goto end;                   /* skip rest of the normal media handling */
+    /* A telephone-event stream is a sibling of the audio stream, not a
+     * replacement for it, so it never becomes the current branch. */
+    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
+    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
+    type = KMS_RECV_BRANCH_DTMF;
+  } else if ((element =
+          kms_base_rtp_endpoint_get_depayloader_for_caps (caps, pts)) != NULL) {
+    type = KMS_RECV_BRANCH_DEPAYLOADER;
+  } else {
+    GST_WARNING_OBJECT (self, "Depayloader not found for caps %" GST_PTR_FORMAT,
+        caps);
+    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
+    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
+    type = KMS_RECV_BRANCH_FAKE;
   }
-  /* Handle regular (non-DTMF) streams */
-  depayloader = kms_base_rtp_endpoint_get_depayloader_for_caps (caps);
+
   gst_caps_unref (caps);
 
-  if (depayloader != NULL) {
-    GST_DEBUG_OBJECT (self, "Found depayloader %" GST_PTR_FORMAT, depayloader);
-    kms_base_rtp_endpoint_update_stats (self, depayloader, media);
-    gst_bin_add (GST_BIN (self), depayloader);
-    gst_element_sync_state_with_parent (depayloader);
+  branch = kms_recv_branch_new (type, media, ssrc, pad, element);
 
-    /* Link depayloader -> agnostic first */
-    if (gst_element_link_pads (depayloader, "src", agnostic, "sink")) {
-      /* Then link rtpbin -> depayloader */
-      GstPad *sink_pad = gst_element_get_static_pad (depayloader, "sink");
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_update_stats (self, element, media);
+  }
 
-      if (sink_pad != NULL) {
-        if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
-          GST_ERROR_OBJECT (self, "Failed to link rtpbin pad to depayloader");
-        }
-        gst_object_unref (sink_pad);
-      }
+  gst_bin_add (GST_BIN (self), element);
+  gst_element_sync_state_with_parent (element);
+
+  /* Register, and claim the media if this is a real depayloader */
+  KMS_ELEMENT_LOCK (self);
+
+  g_hash_table_replace (self->priv->recv_branches, branch->pad_name, branch);
+
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    if (session == AUDIO_RTP_SESSION) {
+      old = self->priv->audio_recv;
+      self->priv->audio_recv = branch;
+      self->priv->audio_config->ssrc = ssrc;
     } else {
+      old = self->priv->video_recv;
+      self->priv->video_recv = branch;
+      self->priv->video_config->ssrc = ssrc;
+    }
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  /* Detach the previous branch BEFORE linking: the agnosticbin has a single
+   * always-sink pad, so it has to be free for the new link to succeed. */
+  if (old != NULL) {
+    GST_INFO_OBJECT (self, "Remote %s SSRC changed: %u -> %u",
+        kms_utils_media_type_to_str (media), old->ssrc, ssrc);
+    kms_base_rtp_endpoint_detach_branch (self, old);
+  }
+
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    linked = gst_element_link_pads (element, "src", agnostic, "sink");
+    if (!linked) {
       GST_ERROR_OBJECT (self, "Failed to link depayloader to agnostic");
     }
-  } else {
-    GstElement *fake = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
-    GstPad *sink_pad;
+  }
 
-    g_object_set (fake, "async", FALSE, "sync", FALSE, NULL);
+  if (linked) {
+    GstPad *sink_pad = gst_element_get_static_pad (element, "sink");
 
-    GST_WARNING_OBJECT (self, "Depayloader not found for pad %" GST_PTR_FORMAT,
-        pad);
-
-    gst_bin_add (GST_BIN (self), fake);
-    gst_element_sync_state_with_parent (fake);
-
-    sink_pad = gst_element_get_static_pad (fake, "sink");
-    if (sink_pad != NULL) {
-      gst_pad_link (pad, sink_pad);
+    if (sink_pad == NULL) {
+      GST_ERROR_OBJECT (self, "Element has no sink pad: %" GST_PTR_FORMAT,
+          element);
+      linked = FALSE;
+    } else {
+      if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
+        GST_ERROR_OBJECT (self, "Failed to link rtpbin pad to %" GST_PTR_FORMAT,
+            element);
+        linked = FALSE;
+      }
       gst_object_unref (sink_pad);
     }
   }
 
-end:
+  /* `pad` must never be left unlinked; see the fallback's comment */
+  if (!linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_branch_fallback_to_fakesink (self, branch);
+  }
+
   GST_PAD_STREAM_UNLOCK (pad);
 
-  if (added) {
+  if (linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
     g_signal_emit (G_OBJECT (self), obj_signals[MEDIA_START], 0, media, TRUE);
   }
+}
+
+/* rtpbin releases a recv_rtp_src pad when its source goes away (RTCP timeout
+ * or session teardown). Without this, recv_branches would grow for the life of
+ * the endpoint, holding references to dead pads. */
+static void
+kms_base_rtp_endpoint_rtpbin_pad_removed (GstElement *rtpbin,
+    GstPad *pad, KmsBaseRtpEndpoint *self)
+{
+  KmsRecvBranch *branch;
+
+  KMS_ELEMENT_LOCK (self);
+
+  /* May fire while GstBin tears down rtpbin, after dispose() cleared this */
+  if (self->priv->recv_branches == NULL) {
+    KMS_ELEMENT_UNLOCK (self);
+    return;
+  }
+
+  branch = g_hash_table_lookup (self->priv->recv_branches,
+      GST_OBJECT_NAME (pad));
+
+  if (branch == NULL) {
+    KMS_ELEMENT_UNLOCK (self);
+    return;
+  }
+
+  if (self->priv->audio_recv == branch) {
+    self->priv->audio_recv = NULL;
+  }
+  if (self->priv->video_recv == branch) {
+    self->priv->video_recv = NULL;
+  }
+
+  /* Steal, so the hash table's destroy notify does not run while the branch is
+   * still needed below. Detaching is idempotent, so it does not matter whether
+   * a switchover already detached this one. */
+  g_hash_table_steal (self->priv->recv_branches, branch->pad_name);
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  kms_base_rtp_endpoint_detach_branch (self, branch);
+  kms_recv_branch_destroy (branch);
 }
 
 static GstPadProbeReturn
@@ -2234,14 +2633,19 @@ kms_base_rtp_endpoint_stop_signal (KmsBaseRtpEndpoint *self,
 
   KMS_ELEMENT_LOCK (self);
 
-  if (ssrc == self->priv->audio_config->ssrc
-      || ssrc == self->priv->video_config->ssrc) {
+  if (ssrc == self->priv->audio_config->ssrc) {
     local = FALSE;
-
-    if (self->priv->audio_config->ssrc == ssrc)
-      self->priv->audio_config->ssrc = 0;
-    else if (self->priv->video_config->ssrc == ssrc)
-      self->priv->video_config->ssrc = 0;
+    self->priv->audio_config->ssrc = 0;
+  } else if (ssrc == self->priv->video_config->ssrc) {
+    local = FALSE;
+    self->priv->video_config->ssrc = 0;
+  } else {
+    /* A BYE or timeout for an SSRC already superseded by a newer one. Falling
+     * through here would emit MEDIA_STOP with local=TRUE, wrongly reporting
+     * that our own side stopped. */
+    KMS_ELEMENT_UNLOCK (self);
+    GST_DEBUG_OBJECT (self, "BYE/timeout for stale SSRC %u, ignoring", ssrc);
+    return;
   }
 
   KMS_ELEMENT_UNLOCK (self);
@@ -2727,6 +3131,24 @@ kms_base_rtp_endpoint_dispose (GObject *gobject)
         KMS_MEDIA_TYPE_VIDEO, TRUE);
   }
 
+  /* Queued disposals still run, and each worker holds its own reference to
+   * the element it was given. Not waiting here is deliberate, and matches
+   * KmsAgnosticBin2: a worker calls gst_bin_remove() on this very bin, so
+   * blocking dispose on it invites a deadlock. */
+  if (self->priv->remove_pool != NULL) {
+    g_thread_pool_free (self->priv->remove_pool, FALSE, FALSE);
+    self->priv->remove_pool = NULL;
+  }
+
+  /* Must happen before chaining up: GstBin's dispose destroys the children
+   * these branches hold references to. */
+  self->priv->audio_recv = NULL;
+  self->priv->video_recv = NULL;
+  g_clear_pointer (&self->priv->recv_branches, g_hash_table_destroy);
+
+  g_clear_pointer (&self->priv->audio_pts, kms_pts_tracker_unref);
+  g_clear_pointer (&self->priv->video_pts, kms_pts_tracker_unref);
+
   rtp_media_config_unref (self->priv->audio_config);
   rtp_media_config_unref (self->priv->video_config);
 
@@ -3195,17 +3617,35 @@ kms_base_rtp_endpoint_rtpbin_on_new_ssrc (GstElement *rtpbin,
 
   KMS_ELEMENT_LOCK (self);
 
+  /* A remote may change its SSRC at any point, so always adopt the latest one
+   * rather than latching the first. Nothing is emitted from here: this fires
+   * before "pad-added", while the previous branch is still live. */
   switch (session) {
     case AUDIO_RTP_SESSION:
-      if (self->priv->audio_config->ssrc != 0) {
+      /* Once a branch is up, pad-added owns this value: it is the one that
+       * knows which SSRC actually carries the media. A sibling stream on the
+       * same session, such as telephone-event, must not claim it here. */
+      if (self->priv->audio_recv != NULL) {
         break;
+      }
+
+      if (self->priv->audio_config->ssrc != 0
+          && self->priv->audio_config->ssrc != ssrc) {
+        GST_INFO_OBJECT (self, "New remote audio SSRC: %u (was %u)", ssrc,
+            self->priv->audio_config->ssrc);
       }
 
       self->priv->audio_config->ssrc = ssrc;
       break;
     case VIDEO_RTP_SESSION:
-      if (self->priv->video_config->ssrc != 0) {
+      if (self->priv->video_recv != NULL) {
         break;
+      }
+
+      if (self->priv->video_config->ssrc != 0
+          && self->priv->video_config->ssrc != ssrc) {
+        GST_INFO_OBJECT (self, "New remote video SSRC: %u (was %u)", ssrc,
+            self->priv->video_config->ssrc);
       }
 
       self->priv->video_config->ssrc = ssrc;
@@ -3295,7 +3735,9 @@ kms_base_rtp_endpoint_rtpbin_on_ssrc_sdes (GstElement *rtpbin,
 
   if (ssrc != self->priv->audio_config->ssrc
       && ssrc != self->priv->video_config->ssrc) {
-    GST_WARNING_OBJECT (self, "SSRC %u not valid", ssrc);
+    /* SDES for an SSRC we are not currently receiving media for. Normal while
+     * a remote is switching SSRC, or when it describes more than one source. */
+    GST_DEBUG_OBJECT (self, "SDES for non-current SSRC %u, ignoring", ssrc);
     KMS_ELEMENT_UNLOCK (self);
     return;
   }
@@ -3573,6 +4015,8 @@ kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint *self)
 
   g_signal_connect (self->priv->rtpbin, "pad-added",
       G_CALLBACK (kms_base_rtp_endpoint_rtpbin_pad_added), self);
+  g_signal_connect (self->priv->rtpbin, "pad-removed",
+      G_CALLBACK (kms_base_rtp_endpoint_rtpbin_pad_removed), self);
 
   g_signal_connect (self->priv->rtpbin, "on-new-ssrc",
       G_CALLBACK (kms_base_rtp_endpoint_rtpbin_on_new_ssrc), self);
@@ -3603,6 +4047,19 @@ kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint *self)
 
   self->priv->audio_config = rtp_media_config_new ();
   self->priv->video_config = rtp_media_config_new ();
+
+  /* The key is the branch's own pad_name, freed by kms_recv_branch_destroy */
+  self->priv->recv_branches = g_hash_table_new_full (g_str_hash, g_str_equal,
+      NULL, (GDestroyNotify) kms_recv_branch_destroy);
+  self->priv->audio_recv = NULL;
+  self->priv->video_recv = NULL;
+
+  self->priv->remove_pool =
+      g_thread_pool_new (kms_base_rtp_endpoint_remove_element_async, NULL, -1,
+      FALSE, NULL);
+
+  self->priv->audio_pts = kms_pts_tracker_new ();
+  self->priv->video_pts = kms_pts_tracker_new ();
 
   kms_base_rtp_endpoint_init_stats (self);
 

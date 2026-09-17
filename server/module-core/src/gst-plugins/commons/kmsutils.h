@@ -115,7 +115,21 @@ void kms_utils_set_pad_event_function_full (GstPad *pad, GstPadEventFunction eve
 /* previous callbacks enabled if chain callbacks is TRUE                 */
 void kms_utils_set_pad_query_function_full (GstPad *pad, GstPadQueryFunction query, gpointer user_data, GDestroyNotify notify, gboolean chain_callbacks);
 
+/* Shared, refcounted "last PTS out" state. Passing the same tracker to a  */
+/* replacement depayloader keeps its output PTS strictly increasing across */
+/* a mid-session SSRC change. Thread safe.                                 */
+typedef struct _KmsPtsTracker KmsPtsTracker;
+
+KmsPtsTracker * kms_pts_tracker_new (void);
+KmsPtsTracker * kms_pts_tracker_ref (KmsPtsTracker * tracker);
+void kms_pts_tracker_unref (KmsPtsTracker * tracker);
+
 void kms_utils_depayloader_monitor_pts_out (GstElement * depayloader);
+
+/* As above, but continues the PTS sequence held by `tracker`. A NULL */
+/* tracker is equivalent to kms_utils_depayloader_monitor_pts_out().  */
+void kms_utils_depayloader_monitor_pts_out_tracked (GstElement * depayloader,
+    KmsPtsTracker * tracker);
 
 /* Get wether an IP address is IPv4 or IPv6. */
 int kms_utils_get_ip_version (const gchar *ip_address);

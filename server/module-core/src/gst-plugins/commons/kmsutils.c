@@ -1411,26 +1411,79 @@ set_func:
 
 // ------------------------ Adjust PTS ------------------------
 
+/* A depayloader normally owns its last-PTS state. But when a remote peer
+ * changes its SSRC mid-session, the depayloader is replaced by a new one
+ * (see kms_base_rtp_endpoint_rtpbin_pad_added). A fresh depayloader has no
+ * history, so on its own it cannot keep the output PTS strictly increasing
+ * across the switch, and downstream elements then drop buffers or stall.
+ * Sharing this state through a tracker lets the replacement carry on from
+ * where its predecessor left off.
+ */
+struct _KmsPtsTracker
+{
+  gint refcount;
+  GMutex mutex;
+  GstClockTime last_pts;
+};
+
+KmsPtsTracker *
+kms_pts_tracker_new (void)
+{
+  KmsPtsTracker *tracker = g_slice_new0 (KmsPtsTracker);
+
+  tracker->refcount = 1;
+  g_mutex_init (&tracker->mutex);
+  tracker->last_pts = GST_CLOCK_TIME_NONE;
+
+  return tracker;
+}
+
+KmsPtsTracker *
+kms_pts_tracker_ref (KmsPtsTracker * tracker)
+{
+  g_return_val_if_fail (tracker != NULL, NULL);
+
+  g_atomic_int_inc (&tracker->refcount);
+
+  return tracker;
+}
+
+void
+kms_pts_tracker_unref (KmsPtsTracker * tracker)
+{
+  if (tracker == NULL) {
+    return;
+  }
+
+  if (g_atomic_int_dec_and_test (&tracker->refcount)) {
+    g_mutex_clear (&tracker->mutex);
+    g_slice_free (KmsPtsTracker, tracker);
+  }
+}
+
 typedef struct _AdjustPtsData
 {
   GstElement *element;
-  GstClockTime last_pts;
+  KmsPtsTracker *tracker;       /* owned */
 } AdjustPtsData;
 
 static void
 kms_utils_adjust_pts_data_destroy (AdjustPtsData * data)
 {
+  kms_pts_tracker_unref (data->tracker);
   g_slice_free (AdjustPtsData, data);
 }
 
 static AdjustPtsData *
-kms_utils_adjust_pts_data_new (GstElement * element)
+kms_utils_adjust_pts_data_new (GstElement * element, KmsPtsTracker * tracker)
 {
   AdjustPtsData *data;
 
   data = g_slice_new0 (AdjustPtsData);
   data->element = element;
-  data->last_pts = GST_CLOCK_TIME_NONE;
+  /* No tracker given: this depayloader keeps its own private state. */
+  data->tracker = (tracker != NULL) ? kms_pts_tracker_ref (tracker)
+      : kms_pts_tracker_new ();
 
   return data;
 }
@@ -1440,16 +1493,21 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
 {
   const GstClockTime pts_current = GST_BUFFER_PTS (buffer);
   GstClockTime pts_fixed = pts_current;
+  KmsPtsTracker *tracker = data->tracker;
 
-  if (GST_CLOCK_TIME_IS_VALID (data->last_pts)
-      && pts_current <= data->last_pts) {
-    pts_fixed = data->last_pts + GST_MSECOND;
+  /* The tracker may be shared with another depayloader across an SSRC
+   * change, so the read-modify-write below has to be atomic. */
+  g_mutex_lock (&tracker->mutex);
+
+  if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)
+      && pts_current <= tracker->last_pts) {
+    pts_fixed = tracker->last_pts + GST_MSECOND;
 
     GST_WARNING_OBJECT (data->element, "Fix PTS not strictly increasing"
         ", last: %" GST_TIME_FORMAT
         ", current: %" GST_TIME_FORMAT
         ", fixed = last + 1: %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (data->last_pts),
+        GST_TIME_ARGS (tracker->last_pts),
         GST_TIME_ARGS (pts_current),
         GST_TIME_ARGS (pts_fixed));
 
@@ -1463,7 +1521,9 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
       GST_TIME_ARGS (pts_fixed));
 
   GST_BUFFER_DTS (buffer) = pts_fixed;
-  data->last_pts = pts_fixed;
+  tracker->last_pts = pts_fixed;
+
+  g_mutex_unlock (&tracker->mutex);
 }
 
 static gboolean
@@ -1500,7 +1560,8 @@ kms_utils_depayloader_pts_out_probe (GstPad * pad, GstPadProbeInfo * info,
 }
 
 void
-kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
+kms_utils_depayloader_monitor_pts_out_tracked (GstElement * depayloader,
+    KmsPtsTracker * tracker)
 {
   GstPad *src_pad;
 
@@ -1510,9 +1571,15 @@ kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
   gst_pad_add_probe (src_pad,
       GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
       (GstPadProbeCallback) kms_utils_depayloader_pts_out_probe,
-      kms_utils_adjust_pts_data_new (depayloader),
+      kms_utils_adjust_pts_data_new (depayloader, tracker),
       (GDestroyNotify) kms_utils_adjust_pts_data_destroy);
   g_object_unref (src_pad);
+}
+
+void
+kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
+{
+  kms_utils_depayloader_monitor_pts_out_tracked (depayloader, NULL);
 }
 
 int
