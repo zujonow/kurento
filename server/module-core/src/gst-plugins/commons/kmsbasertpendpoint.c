@@ -75,6 +75,18 @@ G_DEFINE_TYPE_WITH_CODE (KmsBaseRtpEndpoint, kms_base_rtp_endpoint,
 #define JB_INITIAL_LATENCY 0
 #define JB_READY_AUDIO_LATENCY 100
 #define JB_READY_VIDEO_LATENCY 500
+
+/* How long the attached SSRC must have been silent before a parked one is
+ * allowed to take the receive branch back.
+ *
+ * It cannot be zero. When a remote switches SSRC, the old one still has packets
+ * in flight and more held inside the jitterbuffer, and they go on arriving for
+ * a while after the switch. Letting any of those reclaim the branch would tear
+ * down and rebuild the depayloader on every single switchover, so the threshold
+ * has to outlast the jitterbuffer for the media -- while staying short enough
+ * that a genuine resume is not audible as a gap. */
+#define BRANCH_TAKEOVER_SILENCE_AUDIO_MS 300  /* JB_READY_AUDIO_LATENCY is 100 */
+#define BRANCH_TAKEOVER_SILENCE_VIDEO_MS 700  /* JB_READY_VIDEO_LATENCY is 500 */
 #define RTCP_FB_CCM_FIR   SDP_MEDIA_RTCP_FB_CCM " " SDP_MEDIA_RTCP_FB_FIR
 #define RTCP_FB_NACK_PLI  SDP_MEDIA_RTCP_FB_NACK " " SDP_MEDIA_RTCP_FB_PLI
 
@@ -223,52 +235,96 @@ typedef enum
   KMS_RECV_BRANCH_FAKE,         /* fakesink, no depayloader available */
 } KmsRecvBranchType;
 
+/* A detached branch is not finished with: its pad stays linked to nothing but a
+ * probe, and if that SSRC starts sending again the branch is attached anew. So
+ * "detached" means parked, not dead, and only pad-removed really ends it. */
 typedef struct _KmsRecvBranch
 {
   KmsRecvBranchType type;
   KmsMediaType media;
+  guint session;                /* AUDIO_RTP_SESSION / VIDEO_RTP_SESSION */
   guint ssrc;                   /* parsed from the pad name; 0 if unknown */
   gchar *pad_name;              /* owned; also the hash table key */
   GstPad *rtpbin_pad;           /* owned ref */
-  GstElement *element;          /* owned ref: depayloader or fakesink */
-  gboolean detached;            /* TRUE once unlinked from the pipeline */
-  gulong drop_probe_id;         /* probe that swallows late data, 0 if none */
+  GstElement *element;          /* owned ref: depayloader or fakesink; NULL while
+                                 * parked, as detaching disposes of it */
+  GstCaps *caps;                /* owned; last caps seen on the pad */
+  gboolean detached;            /* TRUE while parked, i.e. not in the pipeline */
+  gboolean removed;             /* rtpbin released the pad; the branch is over */
+  gulong probe_id;              /* branch probe; lives as long as the branch */
+
+  /* Read and written by the branch probe, so they are atomic rather than
+   * guarded by KMS_ELEMENT_LOCK. The probe must not take that lock: a thread
+   * holding it may be inside gst_pad_remove_probe(), which waits for a running
+   * probe callback to return, and the two would deadlock. */
+  gint drop;                    /* 1 while parked: the probe swallows data */
+  gint revive_pending;          /* CAS latch; 1 once a revival is queued */
+
+  /* The hash table holds one reference; a revival in flight holds another, so
+   * that pad-removed cannot free the branch underneath it. */
+  gint refcount;
+
+  /* Not reffed: a branch never outlives the endpoint that owns it, and taking a
+   * reference here would keep the endpoint alive from its own private data. */
+  KmsBaseRtpEndpoint *endpoint;
 } KmsRecvBranch;
 
+/* The element and type are left unset: kms_base_rtp_endpoint_attach_branch()
+ * fills them in, both for the first attachment and for every revival. */
 static KmsRecvBranch *
-kms_recv_branch_new (KmsRecvBranchType type, KmsMediaType media, guint ssrc,
-    GstPad *pad, GstElement *element)
+kms_recv_branch_new (KmsBaseRtpEndpoint *endpoint, KmsMediaType media,
+    guint session, guint ssrc, GstPad *pad)
 {
   KmsRecvBranch *branch = g_slice_new0 (KmsRecvBranch);
 
-  branch->type = type;
+  branch->endpoint = endpoint;
   branch->media = media;
+  branch->session = session;
   branch->ssrc = ssrc;
   branch->pad_name = g_strdup (GST_OBJECT_NAME (pad));
   branch->rtpbin_pad = gst_object_ref (pad);
-  branch->element = gst_object_ref (element);
+  branch->detached = TRUE;      /* until attach_branch links it */
+  branch->drop = 1;
+  branch->refcount = 1;
+
+  /* Not the zero value of the enum: until attach_branch has decided what this
+   * pad carries, the branch must not look to the probe like a depayloader that
+   * could claim the media. */
+  branch->type = KMS_RECV_BRANCH_FAKE;
 
   return branch;
 }
 
-/* Drops references only. It must not change element state nor touch the bin:
+static KmsRecvBranch *
+kms_recv_branch_ref (KmsRecvBranch *branch)
+{
+  g_atomic_int_inc (&branch->refcount);
+
+  return branch;
+}
+
+/* Drops the last reference. It must not change element state nor touch the bin:
  * it also runs from dispose(), where GstBin still owns the elements and is
  * about to tear them down itself.
  */
 static void
-kms_recv_branch_destroy (KmsRecvBranch *branch)
+kms_recv_branch_unref (KmsRecvBranch *branch)
 {
-  if (branch == NULL) {
+  if (branch == NULL || !g_atomic_int_dec_and_test (&branch->refcount)) {
     return;
   }
 
-  if (branch->drop_probe_id != 0 && branch->rtpbin_pad != NULL) {
-    gst_pad_remove_probe (branch->rtpbin_pad, branch->drop_probe_id);
-    branch->drop_probe_id = 0;
+  /* Before freeing anything the probe reads. gst_pad_remove_probe() waits for a
+   * running callback to return, so afterwards no probe can be looking at this
+   * branch. */
+  if (branch->probe_id != 0 && branch->rtpbin_pad != NULL) {
+    gst_pad_remove_probe (branch->rtpbin_pad, branch->probe_id);
+    branch->probe_id = 0;
   }
 
   g_clear_pointer (&branch->rtpbin_pad, gst_object_unref);
   g_clear_pointer (&branch->element, gst_object_unref);
+  g_clear_pointer (&branch->caps, gst_caps_unref);
   g_free (branch->pad_name);
 
   g_slice_free (KmsRecvBranch, branch);
@@ -301,9 +357,23 @@ struct _KmsBaseRtpEndpointPrivate
   KmsRecvBranch *audio_recv;
   KmsRecvBranch *video_recv;
 
+  /* Monotonic milliseconds of the last buffer the *attached* branch carried,
+   * per media. Atomic, and deliberately kept here rather than on the branch: it
+   * lets a parked branch's probe answer "is the SSRC that replaced me still
+   * sending?" with one atomic load, instead of chasing audio_recv/video_recv,
+   * which would mean taking KMS_ELEMENT_LOCK on a streaming thread. */
+  gint audio_recv_last_ms;
+  gint video_recv_last_ms;
+
   /* Detached branches are disposed here. Never set an element to GST_STATE_NULL
    * from a streaming thread; see kms_base_rtp_endpoint_detach_branch(). */
   GThreadPool *remove_pool;
+
+  /* Parked branches are brought back here, for the same reason: reviving one
+   * builds a depayloader and links it, which must not happen on the streaming
+   * thread that noticed the SSRC had resumed. Carries owned pad name strings,
+   * never branch pointers; see kms_base_rtp_endpoint_revive_branch_async(). */
+  GThreadPool *revive_pool;
 
   /* Keeps depayloader output PTS increasing across an SSRC change. */
   KmsPtsTracker *audio_pts;
@@ -2163,6 +2233,132 @@ kms_base_rtp_endpoint_drop_probe (GstPad *pad, GstPadProbeInfo *info,
   return GST_PAD_PROBE_DROP;
 }
 
+static gint
+kms_base_rtp_endpoint_takeover_silence_ms (KmsMediaType media)
+{
+  return (media == KMS_MEDIA_TYPE_VIDEO)
+      ? BRANCH_TAKEOVER_SILENCE_VIDEO_MS : BRANCH_TAKEOVER_SILENCE_AUDIO_MS;
+}
+
+/* Truncating the monotonic clock to 32 bits is fine here: every use is a
+ * difference, and signed wrap-around arithmetic stays correct for any interval
+ * shorter than about 24 days. */
+static gint
+kms_base_rtp_endpoint_now_ms (void)
+{
+  return (gint) (g_get_monotonic_time () / 1000);
+}
+
+static gint *
+kms_base_rtp_endpoint_activity_slot (KmsBaseRtpEndpoint *self,
+    KmsMediaType media)
+{
+  return (media == KMS_MEDIA_TYPE_AUDIO)
+      ? &self->priv->audio_recv_last_ms : &self->priv->video_recv_last_ms;
+}
+
+/* Backdates a media's activity so that a parked branch may take it at once.
+ * Used when a media loses its branch outright: there is nothing left to wait
+ * for, and making a parked SSRC sit out the full silence window would only add
+ * dead air. */
+static void
+kms_base_rtp_endpoint_expire_activity (KmsBaseRtpEndpoint *self,
+    KmsMediaType media)
+{
+  g_atomic_int_set (kms_base_rtp_endpoint_activity_slot (self, media),
+      kms_base_rtp_endpoint_now_ms () - 2 * BRANCH_TAKEOVER_SILENCE_VIDEO_MS);
+}
+
+static void kms_base_rtp_endpoint_queue_revive (KmsBaseRtpEndpoint *self,
+    const gchar *pad_name);
+/* The probe every branch carries for its whole life, on its rtpbin pad.
+ *
+ * While the branch is attached it only records that data is arriving. That
+ * record is what makes a takeover decision possible at all: it is how a parked
+ * branch can tell whether the SSRC that replaced it is still sending.
+ *
+ * While the branch is parked it swallows data, and watches for its own SSRC to
+ * resume. Dropping rather than leaving the pad unlinked is deliberate: a DROP
+ * makes gst_pad_push() report GST_FLOW_OK upstream, whereas an unlinked pad
+ * reports GST_FLOW_NOT_LINKED and takes the whole pipeline down with an
+ * "Internal data stream error".
+ *
+ * Runs on a streaming thread and takes NO locks. It must not: a thread holding
+ * KMS_ELEMENT_LOCK may be inside gst_pad_remove_probe(), which waits for a
+ * running probe callback to return, and waiting for that lock here would
+ * deadlock the two. Everything it reads is therefore atomic.
+ *
+ * user_data is the branch. That is safe because the branch's last unref removes
+ * this probe before freeing anything.
+ */
+static GstPadProbeReturn
+kms_base_rtp_endpoint_branch_probe (GstPad *pad, GstPadProbeInfo *info,
+    gpointer user_data)
+{
+  KmsRecvBranch *branch = user_data;
+  KmsBaseRtpEndpoint *self = branch->endpoint;
+  gboolean is_data;
+  gint now, silent_for;
+
+  is_data = (GST_PAD_PROBE_INFO_TYPE (info) & (GST_PAD_PROBE_TYPE_BUFFER
+          | GST_PAD_PROBE_TYPE_BUFFER_LIST)) != 0;
+
+  if (!g_atomic_int_get (&branch->drop)) {
+    /* Attached. Only a depayloader branch speaks for the media: a
+     * telephone-event sibling shares the session but must not make the media
+     * look alive on its own. */
+    if (is_data && branch->type == KMS_RECV_BRANCH_DEPAYLOADER) {
+      g_atomic_int_set (kms_base_rtp_endpoint_activity_slot (self,
+              branch->media), kms_base_rtp_endpoint_now_ms ());
+    }
+
+    return GST_PAD_PROBE_OK;
+  }
+
+  /* Parked. */
+  if (!is_data) {
+    GstEvent *event = gst_pad_probe_info_get_event (info);
+
+    /* The pad has no peer, so passing an event pushes it nowhere -- but it is
+     * still recorded in the pad's sticky store, and that is what keeps
+     * gst_pad_get_current_caps() truthful for a later revival. EOS is the
+     * exception: replaying it would end the revived stream before it began. */
+    return (event != NULL && GST_EVENT_TYPE (event) == GST_EVENT_EOS)
+        ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
+  }
+
+  if (branch->type != KMS_RECV_BRANCH_DEPAYLOADER) {
+    return GST_PAD_PROBE_DROP;  /* DTMF and fake branches never claim a media */
+  }
+
+  /* This SSRC is sending again. Wait for the one that replaced it to fall
+   * silent first: right after a switchover it is still draining packets that
+   * were already in flight, and reclaiming the branch from under those would
+   * rebuild the depayloader on every switchover rather than only on a genuine
+   * resume. */
+  now = kms_base_rtp_endpoint_now_ms ();
+  silent_for = now - g_atomic_int_get (
+      kms_base_rtp_endpoint_activity_slot (self, branch->media));
+
+  if (silent_for <= kms_base_rtp_endpoint_takeover_silence_ms (branch->media)) {
+    return GST_PAD_PROBE_DROP;
+  }
+
+  /* Compare-and-swap, not a plain flag: several buffers can be in this probe at
+   * once, and only the first of them may queue the revival. */
+  if (!g_atomic_int_compare_and_exchange (&branch->revive_pending, 0, 1)) {
+    return GST_PAD_PROBE_DROP;
+  }
+
+  GST_INFO_OBJECT (self, "Remote %s SSRC %u resumed; reviving its branch",
+      kms_utils_media_type_to_str (branch->media), branch->ssrc);
+
+  kms_base_rtp_endpoint_queue_revive (self, branch->pad_name);
+
+  /* Still parked: data only flows once the worker has linked the branch. */
+  return GST_PAD_PROBE_DROP;
+}
+
 /* Disposes of an element away from any streaming thread. Ordering follows
  * remove_on_unlinked_async() in kmsagnosticbin.c: remove from the bin while
  * still PAUSED, then go to NULL. Consumes the reference it is given. */
@@ -2215,14 +2411,15 @@ kms_base_rtp_endpoint_remove_stats_probe (KmsBaseRtpEndpoint *self,
   gst_object_unref (pad);
 }
 
-/* Unlinks a branch's element on both sides and queues it for disposal.
+/* Unlinks a branch's element on both sides and queues it for disposal. Does
+ * not consume the reference it is given.
  *
  * Both unlinks have to happen here and now. Leaving the downstream one to the
  * worker thread's gst_bin_remove() would race the caller, which is about to
  * link a replacement into the agnosticbin's single always-sink pad. */
 static void
 kms_base_rtp_endpoint_dispose_branch_element (KmsBaseRtpEndpoint *self,
-    KmsRecvBranch *branch)
+    GstElement *element)
 {
   GstPad *src_pad, *sink_pad, *peer;
 
@@ -2231,7 +2428,7 @@ kms_base_rtp_endpoint_dispose_branch_element (KmsBaseRtpEndpoint *self,
    * upstream and error out the pipeline. Returning DROP makes gst_pad_push()
    * report GST_FLOW_OK instead. The probe needs no bookkeeping, as it goes
    * away with the element. */
-  src_pad = gst_element_get_static_pad (branch->element, "src");
+  src_pad = gst_element_get_static_pad (element, "src");
   if (src_pad != NULL) {
     gst_pad_add_probe (src_pad,
         GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
@@ -2239,10 +2436,15 @@ kms_base_rtp_endpoint_dispose_branch_element (KmsBaseRtpEndpoint *self,
         kms_base_rtp_endpoint_drop_probe, NULL, NULL);
   }
 
-  /* Upstream first, so no new data enters the element */
-  sink_pad = gst_element_get_static_pad (branch->element, "sink");
+  /* Upstream first, so no new data enters the element. The peer here is the
+   * rtpbin pad, which stays alive: the branch holds a reference to it. */
+  sink_pad = gst_element_get_static_pad (element, "sink");
   if (sink_pad != NULL) {
-    gst_pad_unlink (branch->rtpbin_pad, sink_pad);
+    peer = gst_pad_get_peer (sink_pad);
+    if (peer != NULL) {
+      gst_pad_unlink (peer, sink_pad);
+      gst_object_unref (peer);
+    }
     gst_object_unref (sink_pad);
   }
 
@@ -2261,25 +2463,31 @@ kms_base_rtp_endpoint_dispose_branch_element (KmsBaseRtpEndpoint *self,
   /* During dispose the pool is already gone; GstBin then disposes of the
    * element itself when it tears down its children. */
   if (self->priv->remove_pool != NULL) {
-    g_thread_pool_push (self->priv->remove_pool,
-        gst_object_ref (branch->element), NULL);
+    g_thread_pool_push (self->priv->remove_pool, gst_object_ref (element),
+        NULL);
   }
 }
 
-/* Takes a receive branch out of the pipeline. Idempotent, and safe to call
- * from a streaming thread.
+/* Parks a receive branch: takes it out of the pipeline but leaves it registered,
+ * so that it can be attached again if its SSRC starts sending. Idempotent, and
+ * safe to call from a streaming thread.
  *
  * Tearing the branch down synchronously is not an option here. Setting an
  * element to GST_STATE_NULL deactivates its sink pad, which takes that pad's
  * stream lock -- but the caller is rtpbin's session thread, which serves every
  * SSRC of the session and may itself be blocked inside the agnosticbin. So:
- * stop data reaching the branch with a drop probe, unlink it, and let a worker
- * thread dispose of the element.
+ * stop data reaching the branch, unlink it, and let a worker thread dispose of
+ * the element.
+ *
+ * The pad keeps its branch probe, which from here on swallows whatever arrives
+ * and watches for the SSRC to resume.
  */
 static void
 kms_base_rtp_endpoint_detach_branch (KmsBaseRtpEndpoint *self,
     KmsRecvBranch *branch)
 {
+  GstElement *element;
+
   /* pad-removed and a switchover can both reach this for the same branch */
   KMS_ELEMENT_LOCK (self);
 
@@ -2289,26 +2497,43 @@ kms_base_rtp_endpoint_detach_branch (KmsBaseRtpEndpoint *self,
   }
   branch->detached = TRUE;
 
+  /* A media left with no branch at all has nothing to wait for, so let a parked
+   * SSRC take it immediately rather than sitting out the silence window. */
+  if (self->priv->audio_recv == branch) {
+    self->priv->audio_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_AUDIO);
+  }
+  if (self->priv->video_recv == branch) {
+    self->priv->video_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_VIDEO);
+  }
+
+  /* Hand the element over to this call. Leaving it on the branch would let a
+   * revival overwrite a pointer to an element already queued for disposal. */
+  element = branch->element;
+  branch->element = NULL;
+
   KMS_ELEMENT_UNLOCK (self);
+
+  /* Park the pad. A mode change, not a probe installation: the probe has been
+   * there since the branch was created and stays there, so that this SSRC can
+   * be attached anew if it resumes. Must happen before the unlink below. */
+  g_atomic_int_set (&branch->drop, 1);
 
   GST_INFO_OBJECT (self, "Detach %s branch, SSRC: %u, pad: %s",
       kms_utils_media_type_to_str (branch->media), branch->ssrc,
       branch->pad_name);
 
-  /* Returning DROP for a buffer makes gst_pad_push() report GST_FLOW_OK
-   * upstream. That is what keeps the source alive should this SSRC resume: an
-   * unlinked pad reports GST_FLOW_NOT_LINKED instead, which takes the whole
-   * pipeline down with an "Internal data stream error". */
-  branch->drop_probe_id = gst_pad_add_probe (branch->rtpbin_pad,
-      GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
-      | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-      kms_base_rtp_endpoint_drop_probe, NULL, NULL);
-
-  if (branch->type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    kms_base_rtp_endpoint_remove_stats_probe (self, branch->element);
+  if (element == NULL) {
+    return;
   }
 
-  kms_base_rtp_endpoint_dispose_branch_element (self, branch);
+  if (branch->type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_remove_stats_probe (self, element);
+  }
+
+  kms_base_rtp_endpoint_dispose_branch_element (self, element);
+  gst_object_unref (element);
 }
 
 /* Last resort when a depayloader cannot be linked: the rtpbin pad must never
@@ -2318,7 +2543,7 @@ static void
 kms_base_rtp_endpoint_branch_fallback_to_fakesink (KmsBaseRtpEndpoint *self,
     KmsRecvBranch *branch)
 {
-  GstElement *fakesink;
+  GstElement *fakesink, *element;
   GstPad *sink_pad;
 
   GST_WARNING_OBJECT (self, "Discarding %s SSRC %u: its depayloader could not"
@@ -2328,26 +2553,40 @@ kms_base_rtp_endpoint_branch_fallback_to_fakesink (KmsBaseRtpEndpoint *self,
 
   if (self->priv->audio_recv == branch) {
     self->priv->audio_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_AUDIO);
   }
   if (self->priv->video_recv == branch) {
     self->priv->video_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_VIDEO);
   }
+
+  element = branch->element;
+  branch->element = NULL;
 
   KMS_ELEMENT_UNLOCK (self);
 
   /* Get rid of the depayloader that could not be linked. It may already be
    * linked to the agnosticbin, if only the upstream link failed. */
-  kms_base_rtp_endpoint_remove_stats_probe (self, branch->element);
-  kms_base_rtp_endpoint_dispose_branch_element (self, branch);
-  gst_object_unref (branch->element);
+  if (element != NULL) {
+    kms_base_rtp_endpoint_remove_stats_probe (self, element);
+    kms_base_rtp_endpoint_dispose_branch_element (self, element);
+    gst_object_unref (element);
+  }
 
   fakesink = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
   g_object_set (fakesink, "async", FALSE, "sync", FALSE, NULL);
   gst_bin_add (GST_BIN (self), fakesink);
   gst_element_sync_state_with_parent (fakesink);
 
+  KMS_ELEMENT_LOCK (self);
   branch->type = KMS_RECV_BRANCH_FAKE;
   branch->element = gst_object_ref (fakesink);
+  branch->detached = FALSE;
+  KMS_ELEMENT_UNLOCK (self);
+
+  /* Linked, even if only to a fakesink, so the probe must stop dropping. */
+  g_atomic_int_set (&branch->drop, 0);
+  g_atomic_int_set (&branch->revive_pending, 0);
 
   sink_pad = gst_element_get_static_pad (fakesink, "sink");
   if (sink_pad != NULL) {
@@ -2359,32 +2598,337 @@ kms_base_rtp_endpoint_branch_fallback_to_fakesink (KmsBaseRtpEndpoint *self,
   }
 }
 
+/* Builds a branch's element from `caps` and puts it into the pipeline, making it
+ * the branch that feeds its media's agnosticbin.
+ *
+ * Used both for a brand new pad and to revive a parked branch whose SSRC has
+ * started sending again; in the latter case the element was disposed of when the
+ * branch was parked, so it is built afresh here.
+ *
+ * The caller must hold the stream lock of branch->rtpbin_pad. Without it the
+ * jitterbuffer task could start pushing on a pad that has no peer yet, and
+ * report NOT_LINKED.
+ *
+ * Returns TRUE if the branch ended up carrying media.
+ */
+static gboolean
+kms_base_rtp_endpoint_attach_branch (KmsBaseRtpEndpoint *self,
+    KmsRecvBranch *branch)
+{
+  KmsRecvBranch *old = NULL;
+  KmsRecvBranchType type;
+  GstElement *agnostic, *element;
+  KmsPtsTracker *pts;
+  GstCaps *caps;
+  gboolean linked = TRUE;
+
+  /* Current caps first: if the remote resumed this SSRC with a renegotiated
+   * payload type, a remembered copy would build the wrong depayloader and emit
+   * silent rubbish -- a worse failure than the one being fixed. But a parked
+   * pad may have none, and gst_pad_query_caps() on one answers with the
+   * template, i.e. ANY, which would match some arbitrary depayloader. So fall
+   * back to what this branch last saw. */
+  caps = gst_pad_get_current_caps (branch->rtpbin_pad);
+  if (caps == NULL) {
+    caps = gst_pad_query_caps (branch->rtpbin_pad, NULL);
+  }
+  if (caps != NULL && (gst_caps_is_any (caps) || gst_caps_is_empty (caps))) {
+    gst_caps_unref (caps);
+    caps = NULL;
+  }
+  if (caps == NULL && branch->caps != NULL) {
+    caps = gst_caps_ref (branch->caps);
+  }
+
+  if (caps == NULL) {
+    GST_WARNING_OBJECT (self, "No caps on %s; leaving SSRC %u parked",
+        branch->pad_name, branch->ssrc);
+    g_atomic_int_set (&branch->revive_pending, 0);
+    return FALSE;
+  }
+
+  gst_caps_replace (&branch->caps, caps);
+
+  if (branch->media == KMS_MEDIA_TYPE_AUDIO) {
+    agnostic = kms_element_get_audio_agnosticbin (KMS_ELEMENT (self));
+    pts = self->priv->audio_pts;
+  } else {
+    agnostic = kms_element_get_video_agnosticbin (KMS_ELEMENT (self));
+    pts = self->priv->video_pts;
+  }
+
+  /* Build the element this pad will feed */
+  if (is_dtmf_caps (caps)) {
+    /* A telephone-event stream is a sibling of the audio stream, not a
+     * replacement for it, so it never becomes the current branch. */
+    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
+    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
+    type = KMS_RECV_BRANCH_DTMF;
+  } else if ((element =
+          kms_base_rtp_endpoint_get_depayloader_for_caps (caps, pts)) != NULL) {
+    type = KMS_RECV_BRANCH_DEPAYLOADER;
+  } else {
+    GST_WARNING_OBJECT (self, "Depayloader not found for caps %" GST_PTR_FORMAT,
+        caps);
+    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
+    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
+    type = KMS_RECV_BRANCH_FAKE;
+  }
+
+  /* A revival gets a new element, so it needs a new stats probe too: the old
+   * one was destroyed along with the element this branch used to have. */
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_update_stats (self, element, branch->media);
+  }
+
+  gst_bin_add (GST_BIN (self), element);
+  gst_element_sync_state_with_parent (element);
+
+  gst_caps_unref (caps);
+
+  /* Register, and claim the media if this is a real depayloader */
+  KMS_ELEMENT_LOCK (self);
+
+  /* The branch may have been retired while the element was being built, by
+   * pad-removed or by its pad name being re-added. Attaching it then would link
+   * a pad nobody owns any more. */
+  if (branch->removed || self->priv->recv_branches == NULL
+      || g_hash_table_lookup (self->priv->recv_branches,
+          branch->pad_name) != branch) {
+    KMS_ELEMENT_UNLOCK (self);
+    GST_DEBUG_OBJECT (self, "Branch %s retired while attaching; discarding",
+        branch->pad_name);
+    /* gst_bin_add() took the element's floating reference, so there is nothing
+     * to unref here: the disposal worker drops the bin's own one. */
+    kms_base_rtp_endpoint_dispose_branch_element (self, element);
+    g_atomic_int_set (&branch->revive_pending, 0);
+    return FALSE;
+  }
+
+  branch->type = type;
+  branch->element = gst_object_ref (element);
+  branch->detached = FALSE;
+
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    if (branch->session == AUDIO_RTP_SESSION) {
+      old = self->priv->audio_recv;
+      self->priv->audio_recv = branch;
+      /* Also tells kms_base_rtp_endpoint_stop_signal() which SSRC is live, so
+       * that a BYE for this one is not mistaken for a stale one. */
+      self->priv->audio_config->ssrc = branch->ssrc;
+    } else {
+      old = self->priv->video_recv;
+      self->priv->video_recv = branch;
+      self->priv->video_config->ssrc = branch->ssrc;
+    }
+
+    if (old == branch) {
+      old = NULL;
+    }
+
+    /* Start this branch's silence clock now, on its behalf. Without it the
+     * first straggler from the branch being superseded would read a stale
+     * timestamp, conclude the media had gone quiet, and bounce it straight
+     * back. */
+    g_atomic_int_set (kms_base_rtp_endpoint_activity_slot (self, branch->media),
+        kms_base_rtp_endpoint_now_ms ());
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  /* Detach the previous branch BEFORE linking: the agnosticbin has a single
+   * always-sink pad, so it has to be free for the new link to succeed. */
+  if (old != NULL) {
+    GST_INFO_OBJECT (self, "Remote %s SSRC changed: %u -> %u",
+        kms_utils_media_type_to_str (branch->media), old->ssrc, branch->ssrc);
+    kms_base_rtp_endpoint_detach_branch (self, old);
+  }
+
+  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    linked = gst_element_link_pads (element, "src", agnostic, "sink");
+    if (!linked) {
+      GST_ERROR_OBJECT (self, "Failed to link depayloader to agnostic");
+    }
+  }
+
+  if (linked) {
+    GstPad *sink_pad = gst_element_get_static_pad (element, "sink");
+
+    if (sink_pad == NULL) {
+      GST_ERROR_OBJECT (self, "Element has no sink pad: %" GST_PTR_FORMAT,
+          element);
+      linked = FALSE;
+    } else {
+      if (gst_pad_link (branch->rtpbin_pad, sink_pad) != GST_PAD_LINK_OK) {
+        GST_ERROR_OBJECT (self, "Failed to link rtpbin pad to %" GST_PTR_FORMAT,
+            element);
+        linked = FALSE;
+      }
+      gst_object_unref (sink_pad);
+    }
+  }
+
+  if (linked) {
+    /* Only now may data flow. Until this point the probe has been dropping, so
+     * no buffer can have reached a pad that was unlinked or half-linked. */
+    g_atomic_int_set (&branch->drop, 0);
+  }
+
+  /* Cleared last and on every path, so that a revival which failed can be
+   * retried by a later buffer instead of latching the branch off for good. */
+  g_atomic_int_set (&branch->revive_pending, 0);
+
+  /* The rtpbin pad must never be left unlinked; see the fallback's comment */
+  if (!linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    kms_base_rtp_endpoint_branch_fallback_to_fakesink (self, branch);
+  }
+
+  if (linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
+    g_signal_emit (G_OBJECT (self), obj_signals[MEDIA_START], 0, branch->media,
+        TRUE);
+  }
+
+  return linked && type == KMS_RECV_BRANCH_DEPAYLOADER;
+}
+
+/* Brings a parked branch back into the pipeline, after its branch probe saw the
+ * SSRC start sending again.
+ *
+ * Runs on the revive pool rather than on the streaming thread that noticed,
+ * because attaching builds an element and links it, and the noticing thread is
+ * one of rtpbin's -- which serves every SSRC of the session and may itself be
+ * blocked inside the agnosticbin.
+ *
+ * `data` is an owned pad name, not a branch: by the time this runs, pad-removed
+ * or a same-name re-add may have freed the branch it was queued for.
+ */
+/* Called from the branch probe, on a streaming thread. Hands the worker an
+ * owned pad name and never a KmsRecvBranch pointer: by the time the task runs,
+ * pad-removed may have retired that branch.
+ *
+ * This is the one place the probe path touches KMS_ELEMENT_LOCK, and only to
+ * close the race against dispose() freeing the pool. It is safe because nothing
+ * that holds the lock ever waits on this streaming thread. */
+static void
+kms_base_rtp_endpoint_queue_revive (KmsBaseRtpEndpoint *self,
+    const gchar *pad_name)
+{
+  gchar *copy = g_strdup (pad_name);
+
+  KMS_ELEMENT_LOCK (self);
+
+  if (self->priv->revive_pool != NULL) {
+    g_thread_pool_push (self->priv->revive_pool, copy, NULL);
+    copy = NULL;
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  g_free (copy);
+}
+
+static void
+kms_base_rtp_endpoint_revive_branch_async (gpointer data, gpointer user_data)
+{
+  KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (user_data);
+  gchar *pad_name = data;
+  KmsRecvBranch *branch = NULL, *current;
+  GstPad *pad = NULL;
+  gboolean revive = FALSE;
+  gint silent_for;
+
+  KMS_ELEMENT_LOCK (self);
+
+  if (self->priv->recv_branches != NULL) {
+    branch = g_hash_table_lookup (self->priv->recv_branches, pad_name);
+  }
+
+  if (branch != NULL && g_atomic_int_get (&branch->revive_pending)
+      && !branch->removed) {
+    /* Hold both across the work below. The branch reference is what lets
+     * pad-removed run concurrently without freeing it underneath us, and the
+     * pad reference keeps the pad alive while waiting for its stream lock --
+     * which cannot be taken while holding KMS_ELEMENT_LOCK, because the branch
+     * probe takes the two the other way round and that would deadlock. */
+    kms_recv_branch_ref (branch);
+    pad = gst_object_ref (branch->rtpbin_pad);
+  } else {
+    branch = NULL;
+  }
+
+  KMS_ELEMENT_UNLOCK (self);
+
+  if (branch == NULL) {
+    g_free (pad_name);
+    return;
+  }
+
+  GST_PAD_STREAM_LOCK (pad);
+  KMS_ELEMENT_LOCK (self);
+
+  /* Everything decided before these locks were taken has to be checked again */
+  if (branch->removed || !branch->detached) {
+    goto done;
+  }
+
+  /* The SSRC that replaced this one may have resumed while this task sat in the
+   * queue, in which case it keeps the branch and this one stays parked. Same
+   * test the probe made, repeated here because it was made without a lock and
+   * has had time to go stale. */
+  current = (branch->session == AUDIO_RTP_SESSION)
+      ? self->priv->audio_recv : self->priv->video_recv;
+
+  silent_for = kms_base_rtp_endpoint_now_ms () - g_atomic_int_get (
+      kms_base_rtp_endpoint_activity_slot (self, branch->media));
+
+  if (current != NULL && current != branch
+      && silent_for <= kms_base_rtp_endpoint_takeover_silence_ms (
+          branch->media)) {
+    GST_DEBUG_OBJECT (self, "SSRC %u is sending again, %u stays parked",
+        current->ssrc, branch->ssrc);
+    goto done;
+  }
+
+  revive = TRUE;
+
+done:
+  KMS_ELEMENT_UNLOCK (self);
+
+  if (revive) {
+    GST_INFO_OBJECT (self, "Revive %s branch, SSRC: %u, pad: %s",
+        kms_utils_media_type_to_str (branch->media), branch->ssrc, pad_name);
+
+    /* Deliberately not under KMS_ELEMENT_LOCK: this links into the agnosticbin,
+     * and it re-checks under the lock itself whatever it needs to. */
+    kms_base_rtp_endpoint_attach_branch (self, branch);
+  } else {
+    g_atomic_int_set (&branch->revive_pending, 0);
+  }
+
+  GST_PAD_STREAM_UNLOCK (pad);
+  gst_object_unref (pad);
+  kms_recv_branch_unref (branch);
+  g_free (pad_name);
+}
+
 static void
 kms_base_rtp_endpoint_rtpbin_pad_added (GstElement *rtpbin,
     GstPad *pad, KmsBaseRtpEndpoint *self)
 {
-  GstElement *agnostic, *element;
-  KmsRecvBranch *branch, *old = NULL;
-  KmsRecvBranchType type;
-  KmsPtsTracker *pts;
+  KmsRecvBranch *branch, *stale;
   KmsMediaType media;
   guint session, ssrc;
   GstCaps *caps;
-  gboolean linked = TRUE;
 
   /* Classify the pad. rtpbin names it "recv_rtp_src_<session>_<ssrc>_<pt>",
    * so the prefix gives the media and the rest gives the SSRC. */
   if (g_str_has_prefix (GST_OBJECT_NAME (pad), AUDIO_RTPBIN_RECV_RTP_SRC)) {
-    agnostic = kms_element_get_audio_agnosticbin (KMS_ELEMENT (self));
     media = KMS_MEDIA_TYPE_AUDIO;
     session = AUDIO_RTP_SESSION;
-    pts = self->priv->audio_pts;
   } else if (g_str_has_prefix (GST_OBJECT_NAME (pad),
           VIDEO_RTPBIN_RECV_RTP_SRC)) {
-    agnostic = kms_element_get_video_agnosticbin (KMS_ELEMENT (self));
     media = KMS_MEDIA_TYPE_VIDEO;
     session = VIDEO_RTP_SESSION;
-    pts = self->priv->video_pts;
 
     if (self->priv->rl != NULL) {
       /* Replacing this without destroying the old one leaks a manager, and
@@ -2407,96 +2951,68 @@ kms_base_rtp_endpoint_rtpbin_pad_added (GstElement *rtpbin,
   GST_DEBUG_OBJECT (self, "New pad: %" GST_PTR_FORMAT ", SSRC: %u"
       ", caps: %" GST_PTR_FORMAT, pad, ssrc, caps);
 
-  /* Build the element this pad will feed */
-  if (is_dtmf_caps (caps)) {
-    /* A telephone-event stream is a sibling of the audio stream, not a
-     * replacement for it, so it never becomes the current branch. */
-    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
-    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
-    type = KMS_RECV_BRANCH_DTMF;
-  } else if ((element =
-          kms_base_rtp_endpoint_get_depayloader_for_caps (caps, pts)) != NULL) {
-    type = KMS_RECV_BRANCH_DEPAYLOADER;
-  } else {
-    GST_WARNING_OBJECT (self, "Depayloader not found for caps %" GST_PTR_FORMAT,
-        caps);
-    element = kms_utils_element_factory_make ("fakesink", PLUGIN_NAME);
-    g_object_set (element, "async", FALSE, "sync", FALSE, NULL);
-    type = KMS_RECV_BRANCH_FAKE;
+  branch = kms_recv_branch_new (self, media, session, ssrc, pad);
+
+  if (caps != NULL) {
+    /* Seeds the fallback attach_branch() uses if the pad ever stops reporting
+     * caps of its own. */
+    gst_caps_replace (&branch->caps, caps);
+    gst_caps_unref (caps);
   }
 
-  gst_caps_unref (caps);
-
-  branch = kms_recv_branch_new (type, media, ssrc, pad, element);
-
-  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    kms_base_rtp_endpoint_update_stats (self, element, media);
-  }
-
-  gst_bin_add (GST_BIN (self), element);
-  gst_element_sync_state_with_parent (element);
-
-  /* Register, and claim the media if this is a real depayloader */
   KMS_ELEMENT_LOCK (self);
 
-  g_hash_table_replace (self->priv->recv_branches, branch->pad_name, branch);
-
-  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    if (session == AUDIO_RTP_SESSION) {
-      old = self->priv->audio_recv;
-      self->priv->audio_recv = branch;
-      self->priv->audio_config->ssrc = ssrc;
-    } else {
-      old = self->priv->video_recv;
-      self->priv->video_recv = branch;
-      self->priv->video_config->ssrc = ssrc;
-    }
+  if (self->priv->recv_branches == NULL) {
+    /* dispose() has already run; there is nothing left to attach to */
+    KMS_ELEMENT_UNLOCK (self);
+    kms_recv_branch_unref (branch);
+    GST_PAD_STREAM_UNLOCK (pad);
+    return;
   }
+
+  /* An SSRC that returns after rtpbin retired it produces a pad with the same
+   * name. Take the stale branch out by hand rather than letting
+   * g_hash_table_insert() run the destroy notify on it: the branch currently
+   * feeding this media may BE that stale branch, and attach_branch would then
+   * be left holding a pointer to freed memory. */
+  stale = g_hash_table_lookup (self->priv->recv_branches, branch->pad_name);
+  if (stale != NULL) {
+    if (self->priv->audio_recv == stale) {
+      self->priv->audio_recv = NULL;
+    }
+    if (self->priv->video_recv == stale) {
+      self->priv->video_recv = NULL;
+    }
+    stale->removed = TRUE;
+    g_atomic_int_set (&stale->revive_pending, 0);
+    g_hash_table_steal (self->priv->recv_branches, stale->pad_name);
+  }
+
+  g_hash_table_insert (self->priv->recv_branches, branch->pad_name, branch);
 
   KMS_ELEMENT_UNLOCK (self);
 
-  /* Detach the previous branch BEFORE linking: the agnosticbin has a single
-   * always-sink pad, so it has to be free for the new link to succeed. */
-  if (old != NULL) {
-    GST_INFO_OBJECT (self, "Remote %s SSRC changed: %u -> %u",
-        kms_utils_media_type_to_str (media), old->ssrc, ssrc);
-    kms_base_rtp_endpoint_detach_branch (self, old);
+  /* Outside the lock: dropping the last reference removes the stale branch's
+   * probe, and gst_pad_remove_probe() waits for a running callback that may
+   * itself be waiting for this lock. */
+  if (stale != NULL) {
+    kms_base_rtp_endpoint_detach_branch (self, stale);
+    kms_recv_branch_unref (stale);
   }
 
-  if (type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    linked = gst_element_link_pads (element, "src", agnostic, "sink");
-    if (!linked) {
-      GST_ERROR_OBJECT (self, "Failed to link depayloader to agnostic");
-    }
-  }
+  /* Watches this pad for as long as the branch exists: notes that data is
+   * arriving while attached, and swallows it while parked. Armed only once the
+   * branch is in the table, so that a revival it triggers can always find it --
+   * one that could not would leave revive_pending latched for good. Nothing can
+   * have been pushed meanwhile: this thread holds the pad's stream lock. */
+  branch->probe_id = gst_pad_add_probe (pad,
+      GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
+      | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      kms_base_rtp_endpoint_branch_probe, branch, NULL);
 
-  if (linked) {
-    GstPad *sink_pad = gst_element_get_static_pad (element, "sink");
-
-    if (sink_pad == NULL) {
-      GST_ERROR_OBJECT (self, "Element has no sink pad: %" GST_PTR_FORMAT,
-          element);
-      linked = FALSE;
-    } else {
-      if (gst_pad_link (pad, sink_pad) != GST_PAD_LINK_OK) {
-        GST_ERROR_OBJECT (self, "Failed to link rtpbin pad to %" GST_PTR_FORMAT,
-            element);
-        linked = FALSE;
-      }
-      gst_object_unref (sink_pad);
-    }
-  }
-
-  /* `pad` must never be left unlinked; see the fallback's comment */
-  if (!linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    kms_base_rtp_endpoint_branch_fallback_to_fakesink (self, branch);
-  }
+  kms_base_rtp_endpoint_attach_branch (self, branch);
 
   GST_PAD_STREAM_UNLOCK (pad);
-
-  if (linked && type == KMS_RECV_BRANCH_DEPAYLOADER) {
-    g_signal_emit (G_OBJECT (self), obj_signals[MEDIA_START], 0, media, TRUE);
-  }
 }
 
 /* rtpbin releases a recv_rtp_src pad when its source goes away (RTCP timeout
@@ -2524,12 +3040,22 @@ kms_base_rtp_endpoint_rtpbin_pad_removed (GstElement *rtpbin,
     return;
   }
 
+  /* Nothing is carrying this media any more, so let a parked SSRC take it at
+   * once rather than sitting out the full silence window. */
   if (self->priv->audio_recv == branch) {
     self->priv->audio_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_AUDIO);
   }
   if (self->priv->video_recv == branch) {
     self->priv->video_recv = NULL;
+    kms_base_rtp_endpoint_expire_activity (self, KMS_MEDIA_TYPE_VIDEO);
   }
+
+  /* The pad is gone for good, so this branch can never be revived. Says so
+   * before releasing the lock, so that a revival already in flight gives up
+   * instead of attaching a branch whose pad no longer exists. */
+  branch->removed = TRUE;
+  g_atomic_int_set (&branch->revive_pending, 0);
 
   /* Steal, so the hash table's destroy notify does not run while the branch is
    * still needed below. Detaching is idempotent, so it does not matter whether
@@ -2539,7 +3065,10 @@ kms_base_rtp_endpoint_rtpbin_pad_removed (GstElement *rtpbin,
   KMS_ELEMENT_UNLOCK (self);
 
   kms_base_rtp_endpoint_detach_branch (self, branch);
-  kms_recv_branch_destroy (branch);
+
+  /* Drops the hash table's reference. A revival still running holds its own, so
+   * the branch outlives this call if it has to. */
+  kms_recv_branch_unref (branch);
 }
 
 static GstPadProbeReturn
@@ -3114,6 +3643,8 @@ static void
 kms_base_rtp_endpoint_dispose (GObject *gobject)
 {
   KmsBaseRtpEndpoint *self = KMS_BASE_RTP_ENDPOINT (gobject);
+  GHashTable *branches;
+  GThreadPool *pool;
 
   GST_DEBUG_OBJECT (self, "dispose");
 
@@ -3140,11 +3671,34 @@ kms_base_rtp_endpoint_dispose (GObject *gobject)
     self->priv->remove_pool = NULL;
   }
 
-  /* Must happen before chaining up: GstBin's dispose destroys the children
-   * these branches hold references to. */
+  /* Take the branches and the revive pool out under the lock, so that neither a
+   * worker nor a probe can race the assignments. The order matters: clearing
+   * recv_branches first is what makes the queued revivals below harmless. */
+  KMS_ELEMENT_LOCK (self);
   self->priv->audio_recv = NULL;
   self->priv->video_recv = NULL;
-  g_clear_pointer (&self->priv->recv_branches, g_hash_table_destroy);
+  branches = self->priv->recv_branches;
+  self->priv->recv_branches = NULL;
+  pool = self->priv->revive_pool;
+  self->priv->revive_pool = NULL;
+  KMS_ELEMENT_UNLOCK (self);
+
+  /* Let the queued revivals run rather than discarding them: each owns a pad
+   * name that only it can free. With recv_branches already gone they look
+   * nothing up and return immediately. Not waiting, for the same reason as the
+   * removal pool above -- a worker may be inside gst_bin_add() on this bin. */
+  if (pool != NULL) {
+    g_thread_pool_free (pool, FALSE, FALSE);
+  }
+
+  /* Destroy the branches outside the lock: dropping a branch's last reference
+   * removes its probe, and gst_pad_remove_probe() waits for a running callback
+   * -- which, for the branch probe, may be in
+   * kms_base_rtp_endpoint_queue_revive() waiting for this very lock.
+   *
+   * Must happen before chaining up: GstBin's dispose destroys the children
+   * these branches hold references to. */
+  g_clear_pointer (&branches, g_hash_table_destroy);
 
   g_clear_pointer (&self->priv->audio_pts, kms_pts_tracker_unref);
   g_clear_pointer (&self->priv->video_pts, kms_pts_tracker_unref);
@@ -4048,15 +4602,24 @@ kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint *self)
   self->priv->audio_config = rtp_media_config_new ();
   self->priv->video_config = rtp_media_config_new ();
 
-  /* The key is the branch's own pad_name, freed by kms_recv_branch_destroy */
+  /* The key is the branch's own pad_name, freed with the branch itself */
   self->priv->recv_branches = g_hash_table_new_full (g_str_hash, g_str_equal,
-      NULL, (GDestroyNotify) kms_recv_branch_destroy);
+      NULL, (GDestroyNotify) kms_recv_branch_unref);
   self->priv->audio_recv = NULL;
   self->priv->video_recv = NULL;
 
   self->priv->remove_pool =
       g_thread_pool_new (kms_base_rtp_endpoint_remove_element_async, NULL, -1,
       FALSE, NULL);
+
+  /* One thread: revivals must be serialized. Two running at once for the same
+   * media could both pass the silence check before either claimed it. */
+  self->priv->revive_pool =
+      g_thread_pool_new (kms_base_rtp_endpoint_revive_branch_async, self, 1,
+      FALSE, NULL);
+
+  self->priv->audio_recv_last_ms = kms_base_rtp_endpoint_now_ms ();
+  self->priv->video_recv_last_ms = kms_base_rtp_endpoint_now_ms ();
 
   self->priv->audio_pts = kms_pts_tracker_new ();
   self->priv->video_pts = kms_pts_tracker_new ();
