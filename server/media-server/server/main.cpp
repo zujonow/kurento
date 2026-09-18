@@ -257,6 +257,7 @@ main (int argc, char **argv)
   transport->start ();
 
   GST_INFO ("Kurento Media Server started");
+  GST_INFO ("Kurento Media Server::SSRC-FIX-v1");
 
   loop->run ();
 
