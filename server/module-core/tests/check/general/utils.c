@@ -376,6 +376,261 @@ GST_START_TEST (check_kms_utils_drop_until_keyframe_bufferlist)
 
 GST_END_TEST;
 
+/* ---- Depayloader PTS out ------------------------------------------------ */
+
+/* A depayloader is destroyed and rebuilt on every SSRC change; only the
+ * KmsPtsTracker crosses the switch. These tests reproduce that literally: one
+ * stream is pushed through a harness holding the tracker, that harness is torn
+ * down, and the next stream is pushed through a fresh one sharing the same
+ * tracker. Nothing about the internals is simulated. */
+
+#define PTS_TEST_PACKET (20 * GST_MSECOND)
+
+typedef struct _PtsRun
+{
+  guint buffers;                /* buffers pulled */
+  guint until_converged;        /* buffer at which out caught up with in, 1-based */
+  guint smallest_step;          /* smallest gap between consecutive emitted PTS */
+  gboolean increasing;          /* emitted PTS strictly increased throughout */
+  GstClockTime last_out;
+} PtsRun;
+
+/* Push `count` buffers `PTS_TEST_PACKET` apart starting at `start`, through a
+ * depayloader sharing `tracker`. A gap of `gap_len` is inserted before buffer
+ * `gap_at` (G_MAXUINT for none). With `no_duration`, buffers carry no duration,
+ * as rtpopusdepay's do. */
+static PtsRun
+pts_push_stream (KmsPtsTracker * tracker, GstClockTime start, guint count,
+    guint gap_at, GstClockTime gap_len, gboolean no_duration)
+{
+  GstElement *identity = gst_element_factory_make ("identity", NULL);
+  GstHarness *h = gst_harness_new_with_element (identity, "sink", "src");
+  PtsRun run = { 0, 0, G_MAXUINT, TRUE, GST_CLOCK_TIME_NONE };
+  GstClockTime in = start;
+  GstClockTime prev_out = GST_CLOCK_TIME_NONE;
+  guint i;
+
+  gst_harness_set_src_caps_str (h, "mycaps");
+  kms_utils_depayloader_monitor_pts_out_tracked (identity, tracker);
+
+  for (i = 0; i < count; i++) {
+    GstBuffer *buf = gst_harness_create_buffer (h, 50);
+    GstBuffer *out;
+    GstClockTime pts_in;
+
+    if (i == gap_at) {
+      in += gap_len;
+    }
+    pts_in = in;
+
+    GST_BUFFER_PTS (buf) = pts_in;
+    GST_BUFFER_DURATION (buf) =
+        no_duration ? GST_CLOCK_TIME_NONE : PTS_TEST_PACKET;
+
+    gst_harness_push (h, buf);
+    out = gst_harness_pull (h);
+    fail_unless (out != NULL, "Harness swallowed a buffer");
+
+    if (GST_CLOCK_TIME_IS_VALID (prev_out)) {
+      if (GST_BUFFER_PTS (out) <= prev_out) {
+        run.increasing = FALSE;
+      } else if (GST_BUFFER_PTS (out) - prev_out < run.smallest_step) {
+        run.smallest_step = GST_BUFFER_PTS (out) - prev_out;
+      }
+    }
+
+    if (run.until_converged == 0 && GST_BUFFER_PTS (out) == pts_in && i > 0) {
+      run.until_converged = i + 1;
+    }
+
+    prev_out = GST_BUFFER_PTS (out);
+    run.last_out = prev_out;
+    run.buffers++;
+    in += PTS_TEST_PACKET;
+    gst_buffer_unref (out);
+  }
+
+  gst_harness_teardown (h);
+  g_object_unref (identity);
+
+  return run;
+}
+
+/* Leaves `tracker` holding exactly `end`, the way the outgoing stream does when
+ * it has burst ahead of the clock: the harness has no clock, so a burst is
+ * simply a tight loop. Ten buffers is enough, and anchoring the last one on
+ * `end` keeps the tracker off arbitrary multiples of the packet duration. */
+static void
+pts_prime_tracker (KmsPtsTracker * tracker, GstClockTime end)
+{
+  pts_push_stream (tracker, end - 9 * PTS_TEST_PACKET, 10, G_MAXUINT, 0, FALSE);
+
+  fail_unless (kms_pts_tracker_peek_last (tracker) == end,
+      "Priming did not leave the tracker where the outgoing stream ended");
+}
+
+GST_START_TEST (check_kms_utils_depayloader_pts_passthrough)
+{
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  PtsRun run;
+
+  fail_unless (!GST_CLOCK_TIME_IS_VALID (kms_pts_tracker_peek_last (tracker)),
+      "A new tracker must not claim to have emitted anything");
+
+  run = pts_push_stream (tracker, 5 * GST_SECOND, 100, G_MAXUINT, 0, FALSE);
+
+  fail_unless (run.increasing, "Emitted PTS did not strictly increase");
+  fail_unless (run.last_out == 5 * GST_SECOND + 99 * PTS_TEST_PACKET,
+      "A healthy stream on a fresh tracker must pass through untouched");
+  fail_unless (run.smallest_step == PTS_TEST_PACKET,
+      "A healthy stream must keep its own pacing");
+
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (check_kms_utils_depayloader_pts_rebase_small)
+{
+  /* Measured on a live SSRC change: the incoming stream started 7.694711ms
+   * behind what the outgoing one had already emitted. */
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  PtsRun run;
+
+  pts_prime_tracker (tracker, 10557864864ULL);
+
+  run = pts_push_stream (tracker, 10550170153ULL, 100, G_MAXUINT, 0, FALSE);
+
+  fail_unless (run.increasing, "Emitted PTS went backwards across the switch");
+  fail_unless (run.until_converged > 0 && run.until_converged <= 12,
+      "A sub-10ms offset should unwind within a handful of buffers");
+
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (check_kms_utils_depayloader_pts_rebase_burst)
+{
+  /* The case this mechanism exists for, measured on a live switch: the
+   * outgoing stream burst 4.389254295s beyond the incoming one's timeline. */
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  PtsRun run;
+
+  pts_prime_tracker (tracker, 23318577272ULL);
+
+  run = pts_push_stream (tracker, 18929322977ULL, 6000, G_MAXUINT, 0, FALSE);
+
+  fail_unless (run.increasing, "Emitted PTS went backwards across the switch");
+
+  /* The assertion that pins the fix. The old code emitted every buffer 1ms
+   * after the last, compressing 4.4s of audio into a few hundred ms; the
+   * rebase keeps the stream's own pacing less the drift. */
+  fail_unless (run.smallest_step >= 19 * GST_MSECOND,
+      "Audio was compressed: emitted PTS advanced by less than one packet "
+      "minus the drift");
+
+  fail_unless (run.until_converged > 4000 && run.until_converged < 4800,
+      "A 4.39s offset at 1ms per buffer should unwind in about 4390 buffers");
+
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (check_kms_utils_depayloader_pts_absorbs_gap)
+{
+  /* A gap in the incoming stream is time nothing has to be emitted in, so the
+   * offset can be given back there for free. */
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  PtsRun run;
+
+  pts_prime_tracker (tracker, 23318577272ULL);
+
+  run = pts_push_stream (tracker, 18929322977ULL, 6000, 100,
+      2 * GST_SECOND, FALSE);
+
+  fail_unless (run.increasing,
+      "Absorbing a gap pushed emitted PTS backwards");
+  fail_unless (run.smallest_step >= 19 * GST_MSECOND,
+      "Absorbing a gap compressed the audio around it");
+  fail_unless (run.until_converged > 0 && run.until_converged < 3000,
+      "A 2s gap should have absorbed most of a 4.39s offset, converging far "
+      "sooner than the ~4390 buffers drift alone needs");
+
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (check_kms_utils_depayloader_pts_no_duration)
+{
+  /* Without a duration there is no way to tell a gap from an ordinary packet,
+   * so absorption must stay off rather than guess: every buffer would look
+   * like a gap its own size and the audio would be overlapped. rtpopusdepay
+   * emits buffers like this. */
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  PtsRun run;
+
+  pts_prime_tracker (tracker, 23318577272ULL);
+
+  run = pts_push_stream (tracker, 18929322977ULL, 6000, 100,
+      2 * GST_SECOND, TRUE);
+
+  fail_unless (run.increasing, "Emitted PTS went backwards across the switch");
+  fail_unless (run.smallest_step >= 19 * GST_MSECOND,
+      "Audio was compressed when buffer duration was unknown");
+
+  /* Drift only: the 2s gap must NOT have been absorbed, so this converges no
+   * sooner than the burst case without a gap at all. */
+  fail_unless (run.until_converged > 4000,
+      "A gap was absorbed although the buffer duration was unknown");
+
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (check_kms_utils_depayloader_pts_invalid)
+{
+  /* GST_CLOCK_TIME_NONE is G_MAXUINT64, so a buffer with no PTS would sail
+   * through the "strictly increasing" test and be stored, after which every
+   * validity check fails and the mechanism silently stops working. */
+  GstElement *identity = gst_element_factory_make ("identity", NULL);
+  GstHarness *h = gst_harness_new_with_element (identity, "sink", "src");
+  KmsPtsTracker *tracker = kms_pts_tracker_new ();
+  GstBuffer *buf, *out;
+
+  gst_harness_set_src_caps_str (h, "mycaps");
+  kms_utils_depayloader_monitor_pts_out_tracked (identity, tracker);
+
+  buf = gst_harness_create_buffer (h, 50);
+  GST_BUFFER_PTS (buf) = 5 * GST_SECOND;
+  GST_BUFFER_DURATION (buf) = PTS_TEST_PACKET;
+  gst_harness_push (h, buf);
+  out = gst_harness_pull (h);
+  gst_buffer_unref (out);
+
+  fail_unless (kms_pts_tracker_peek_last (tracker) == 5 * GST_SECOND,
+      "The tracker did not record an ordinary buffer");
+
+  buf = gst_harness_create_buffer (h, 50);
+  GST_BUFFER_PTS (buf) = GST_CLOCK_TIME_NONE;
+  GST_BUFFER_DURATION (buf) = PTS_TEST_PACKET;
+  gst_harness_push (h, buf);
+  out = gst_harness_pull (h);
+  gst_buffer_unref (out);
+
+  fail_unless (kms_pts_tracker_peek_last (tracker) == 5 * GST_SECOND,
+      "A buffer with no PTS poisoned the tracker");
+
+  gst_harness_teardown (h);
+  g_object_unref (identity);
+  kms_pts_tracker_unref (tracker);
+}
+
+GST_END_TEST;
+
 /* Suite initialization */
 static Suite *
 utils_suite (void)
@@ -392,6 +647,13 @@ utils_suite (void)
   
   tcase_add_test (tc_chain, check_kms_utils_drop_until_keyframe_buffer);
   tcase_add_test (tc_chain, check_kms_utils_drop_until_keyframe_bufferlist);
+
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_passthrough);
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_rebase_small);
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_rebase_burst);
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_absorbs_gap);
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_no_duration);
+  tcase_add_test (tc_chain, check_kms_utils_depayloader_pts_invalid);
 
   return s;
 }
