@@ -1498,6 +1498,12 @@ typedef struct _AdjustPtsData
   GstClockTime offset;
   GstClockTime offset_initial;  /* what it started at, for the closing log */
   guint64 offset_buffers;       /* buffers carried since it was established */
+  GstClockTime absorbed;        /* of offset_initial, how much cost no audio */
+
+  /* End of the previous incoming buffer (its PTS plus its duration), or
+   * GST_CLOCK_TIME_NONE when that could not be determined. Anything beyond it
+   * is a gap in the stream: time in which nothing has to be emitted. */
+  GstClockTime prev_in_end;
 
   /* Diagnostics. `seen_first` is exactly "the first buffer after an SSRC
    * switch", the moment that reveals where the new stream's timeline starts.
@@ -1520,6 +1526,7 @@ kms_utils_adjust_pts_data_new (GstElement * element, KmsPtsTracker * tracker)
 
   data = g_slice_new0 (AdjustPtsData);
   data->element = element;
+  data->prev_in_end = GST_CLOCK_TIME_NONE;
   /* No tracker given: this depayloader keeps its own private state. */
   data->tracker = (tracker != NULL) ? kms_pts_tracker_ref (tracker)
       : kms_pts_tracker_new ();
@@ -1531,7 +1538,9 @@ static void
 kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
 {
   const GstClockTime pts_current = GST_BUFFER_PTS (buffer);
+  const GstClockTime duration = GST_BUFFER_DURATION (buffer);
   GstClockTime pts_fixed = pts_current;
+  GstClockTime offset_at_entry;
   KmsPtsTracker *tracker = data->tracker;
 
   /* A buffer with no PTS must not reach the tracker. GST_CLOCK_TIME_NONE is
@@ -1582,19 +1591,49 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
     }
   }
 
-  /* Give back a little of the offset on every buffer, so that a stream rebased
-   * over a predecessor that ran ahead of the clock drifts back to real time
-   * instead of staying ahead of it forever. */
+  offset_at_entry = data->offset;
+
+  /* Free catch-up. A gap in the incoming stream is time in which nothing has
+   * to be emitted, so closing it gives the offset back without shortening any
+   * audio at all. Silence suppression, comfort noise and packet loss all
+   * produce these, which is why this converges far faster than the drift below
+   * on real speech. Only attempted when the previous buffer's duration was
+   * known -- without it every packet would look like a gap the size of itself,
+   * and the whole offset would be absorbed into overlapping audio. */
+  if (data->offset > 0 && GST_CLOCK_TIME_IS_VALID (data->prev_in_end)
+      && pts_current > data->prev_in_end) {
+    const GstClockTime gap = pts_current - data->prev_in_end;
+    const GstClockTime taken = MIN (data->offset, gap);
+
+    data->offset -= taken;
+    data->absorbed += taken;
+
+    GST_DEBUG_OBJECT (data->element, "Absorbed PTS offset into a gap"
+        ", gap: %" GST_TIME_FORMAT
+        ", taken: %" GST_TIME_FORMAT
+        ", offset left: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (gap), GST_TIME_ARGS (taken),
+        GST_TIME_ARGS (data->offset));
+  }
+
+  /* Paid catch-up. Shortens each packet slightly, so downstream loses
+   * drift/duration of the audio. Only reached when the stream offers no gaps
+   * to absorb. */
   if (data->offset > 0) {
     data->offset -= MIN (data->offset, PTS_OFFSET_DRIFT);
+  }
+
+  if (offset_at_entry > 0) {
     data->offset_buffers++;
 
     if (data->offset == 0) {
       GST_INFO_OBJECT (data->element, "PTS offset unwound"
           ", was: %" GST_TIME_FORMAT
+          ", absorbed into gaps: %" GST_TIME_FORMAT
           ", buffers taken: %" G_GUINT64_FORMAT
           ", buffers clamped: %" G_GUINT64_FORMAT,
           GST_TIME_ARGS (data->offset_initial),
+          GST_TIME_ARGS (data->absorbed),
           data->offset_buffers, data->clamped_count);
     }
   }
@@ -1617,6 +1656,7 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
       data->offset_initial = data->offset;
       data->offset_buffers = 0;
       data->clamped_count = 0;
+      data->absorbed = 0;
 
       /* State up front what this will cost, so a log does not have to be
        * measured after the fact to find out. */
@@ -1625,7 +1665,7 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
           ", already emitted: %" GST_TIME_FORMAT
           ", offset applied: %" GST_TIME_FORMAT
           ", unwinding at %" GST_TIME_FORMAT " per buffer"
-          " (~%" G_GUINT64_FORMAT " buffers)",
+          " (~%" G_GUINT64_FORMAT " buffers, sooner if the stream has gaps)",
           GST_TIME_ARGS (pts_current),
           GST_TIME_ARGS (tracker->last_pts),
           GST_TIME_ARGS (data->offset),
@@ -1661,6 +1701,11 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
 
   GST_BUFFER_DTS (buffer) = pts_fixed;
   tracker->last_pts = pts_fixed;
+
+  /* Deliberately the INCOMING timeline, not the emitted one: the gap test asks
+   * what the sender left empty, which the offset must not distort. */
+  data->prev_in_end = GST_CLOCK_TIME_IS_VALID (duration)
+      ? (pts_current + duration) : GST_CLOCK_TIME_NONE;
 
   g_mutex_unlock (&tracker->mutex);
 }
