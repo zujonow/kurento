@@ -124,6 +124,10 @@ KmsPtsTracker * kms_pts_tracker_new (void);
 KmsPtsTracker * kms_pts_tracker_ref (KmsPtsTracker * tracker);
 void kms_pts_tracker_unref (KmsPtsTracker * tracker);
 
+/* Last PTS handed downstream, or GST_CLOCK_TIME_NONE if none yet. For    */
+/* diagnostics: the value is a snapshot and may be stale on return.       */
+GstClockTime kms_pts_tracker_peek_last (KmsPtsTracker * tracker);
+
 void kms_utils_depayloader_monitor_pts_out (GstElement * depayloader);
 
 /* As above, but continues the PTS sequence held by `tracker`. A NULL */

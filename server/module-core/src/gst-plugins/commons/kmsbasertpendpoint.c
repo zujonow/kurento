@@ -2739,8 +2739,24 @@ kms_base_rtp_endpoint_attach_branch (KmsBaseRtpEndpoint *self,
   /* Detach the previous branch BEFORE linking: the agnosticbin has a single
    * always-sink pad, so it has to be free for the new link to succeed. */
   if (old != NULL) {
-    GST_INFO_OBJECT (self, "Remote %s SSRC changed: %u -> %u",
-        kms_utils_media_type_to_str (branch->media), old->ssrc, branch->ssrc);
+    /* Anchor the switch to wall-clock and to the PTS the outgoing branch
+     * leaves behind: the incoming depayloader inherits exactly that value, and
+     * its own "First buffer out" line reports what it starts from. */
+    GstClockTime running_time = GST_CLOCK_TIME_NONE;
+    GstClock *clock = gst_element_get_clock (GST_ELEMENT (self));
+
+    if (clock != NULL) {
+      running_time = gst_clock_get_time (clock)
+          - gst_element_get_base_time (GST_ELEMENT (self));
+      gst_object_unref (clock);
+    }
+
+    GST_INFO_OBJECT (self, "Remote %s SSRC changed: %u -> %u"
+        ", running time: %" GST_TIME_FORMAT
+        ", outgoing last PTS: %" GST_TIME_FORMAT,
+        kms_utils_media_type_to_str (branch->media), old->ssrc, branch->ssrc,
+        GST_TIME_ARGS (running_time),
+        GST_TIME_ARGS (kms_pts_tracker_peek_last (pts)));
     kms_base_rtp_endpoint_detach_branch (self, old);
   }
 
@@ -3103,6 +3119,120 @@ kms_base_rtp_endpoint_jitterbuffer_set_latency (GstElement *jitterbuffer,
   g_object_unref (src_pad);
 }
 
+/* Diagnostic only. Reports the timeline a new SSRC's jitterbuffer starts on, so
+ * that the gap a depayloader reports in "First buffer out" can be attributed:
+ * either this jitterbuffer's segment is wrong, or the PTS inherited from the
+ * previous SSRC is. Stays installed until it has seen a buffer, then leaves. */
+typedef struct _JbTimelineProbe
+{
+  GstElement *endpoint;         /* owned */
+  guint session;
+  guint ssrc;
+} JbTimelineProbe;
+
+static void
+kms_base_rtp_endpoint_jb_timeline_probe_free (JbTimelineProbe *probe)
+{
+  gst_object_unref (probe->endpoint);
+  g_slice_free (JbTimelineProbe, probe);
+}
+
+static GstPadProbeReturn
+kms_base_rtp_endpoint_jitterbuffer_timeline_probe (GstPad *pad,
+    GstPadProbeInfo *info, gpointer user_data)
+{
+  JbTimelineProbe *probe = user_data;
+  GstElement *jitterbuffer = GST_PAD_PARENT (pad);
+  GstBuffer *buffer = NULL;
+  GstClockTime running_time = GST_CLOCK_TIME_NONE;
+  GstClock *clock;
+  gint latency = -1;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+    GstEvent *event = gst_pad_probe_info_get_event (info);
+    const GstSegment *segment = NULL;
+
+    if (event == NULL || GST_EVENT_TYPE (event) != GST_EVENT_SEGMENT) {
+      return GST_PAD_PROBE_OK;
+    }
+
+    gst_event_parse_segment (event, &segment);
+
+    GST_INFO_OBJECT (jitterbuffer, "Timeline: session %u, SSRC %u, segment"
+        ", base: %" GST_TIME_FORMAT
+        ", start: %" GST_TIME_FORMAT
+        ", time: %" GST_TIME_FORMAT
+        ", rate: %f",
+        probe->session, probe->ssrc,
+        GST_TIME_ARGS (segment->base),
+        GST_TIME_ARGS (segment->start),
+        GST_TIME_ARGS (segment->time),
+        segment->rate);
+
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    buffer = gst_pad_probe_info_get_buffer (info);
+  }
+  else if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+    GstBufferList *list = gst_pad_probe_info_get_buffer_list (info);
+
+    if (list != NULL && gst_buffer_list_length (list) > 0) {
+      buffer = gst_buffer_list_get (list, 0);
+    }
+  }
+
+  if (buffer == NULL) {
+    return GST_PAD_PROBE_OK;
+  }
+
+  clock = gst_element_get_clock (probe->endpoint);
+  if (clock != NULL) {
+    running_time = gst_clock_get_time (clock)
+        - gst_element_get_base_time (probe->endpoint);
+    gst_object_unref (clock);
+  }
+
+  g_object_get (jitterbuffer, "latency", &latency, NULL);
+
+  /* This is the comparison that decides it: a PTS trailing the running time by
+   * roughly the latency means the jitterbuffer is healthy, and any gap the
+   * depayloader reports was inherited rather than produced here. */
+  GST_INFO_OBJECT (jitterbuffer, "Timeline: session %u, SSRC %u, first buffer"
+      ", PTS: %" GST_TIME_FORMAT
+      ", DTS: %" GST_TIME_FORMAT
+      ", running time: %" GST_TIME_FORMAT
+      ", latency: %d ms; remove probe",
+      probe->session, probe->ssrc,
+      GST_TIME_ARGS (GST_BUFFER_PTS (buffer)),
+      GST_TIME_ARGS (GST_BUFFER_DTS (buffer)),
+      GST_TIME_ARGS (running_time), latency);
+
+  return GST_PAD_PROBE_REMOVE;
+}
+
+static void
+kms_base_rtp_endpoint_jitterbuffer_report_timeline (GstElement *jitterbuffer,
+    guint session, guint ssrc, KmsBaseRtpEndpoint *self)
+{
+  JbTimelineProbe *probe = g_slice_new0 (JbTimelineProbe);
+  GstPad *src_pad = gst_element_get_static_pad (jitterbuffer, "src");
+
+  probe->endpoint = gst_object_ref (GST_ELEMENT (self));
+  probe->session = session;
+  probe->ssrc = ssrc;
+
+  GST_INFO_OBJECT (jitterbuffer, "Add probe: Report SSRC %u timeline", ssrc);
+
+  gst_pad_add_probe (src_pad,
+      GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST
+      | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      kms_base_rtp_endpoint_jitterbuffer_timeline_probe, probe,
+      (GDestroyNotify) kms_base_rtp_endpoint_jb_timeline_probe_free);
+  g_object_unref (src_pad);
+}
+
 static void
 kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement *rtpbin,
     GstElement *jitterbuffer,
@@ -3113,6 +3243,9 @@ kms_base_rtp_endpoint_rtpbin_new_jitterbuffer (GstElement *rtpbin,
 
   g_object_set (jitterbuffer, "mode", 4 /* synced */ , "do-lost", TRUE,
       "latency", JB_INITIAL_LATENCY, NULL);
+
+  kms_base_rtp_endpoint_jitterbuffer_report_timeline (jitterbuffer, session,
+      ssrc, self);
 
   switch (session) {
     case AUDIO_RTP_SESSION:{

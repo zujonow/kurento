@@ -1461,10 +1461,33 @@ kms_pts_tracker_unref (KmsPtsTracker * tracker)
   }
 }
 
+GstClockTime
+kms_pts_tracker_peek_last (KmsPtsTracker * tracker)
+{
+  GstClockTime last_pts;
+
+  g_return_val_if_fail (tracker != NULL, GST_CLOCK_TIME_NONE);
+
+  g_mutex_lock (&tracker->mutex);
+  last_pts = tracker->last_pts;
+  g_mutex_unlock (&tracker->mutex);
+
+  return last_pts;
+}
+
 typedef struct _AdjustPtsData
 {
   GstElement *element;
   KmsPtsTracker *tracker;       /* owned */
+
+  /* Diagnostics. A depayloader is rebuilt on every attach, so this struct is
+   * fresh per branch: `seen_first` is therefore exactly "the first buffer after
+   * an SSRC switch", the moment that reveals how far back the new stream's
+   * timeline starts. All of it is touched only under tracker->mutex. */
+  gboolean seen_first;
+  guint64 clamped_count;
+  GstClockTime clamped_first_pts;       /* incoming PTS that started the run */
+  GstClockTime clamped_first_fixed;     /* what it was rewritten to */
 } AdjustPtsData;
 
 static void
@@ -1499,19 +1522,76 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
    * change, so the read-modify-write below has to be atomic. */
   g_mutex_lock (&tracker->mutex);
 
+  if (!data->seen_first) {
+    data->seen_first = TRUE;
+
+    /* One line per branch, at the only moment that carries the answer: what
+     * timeline this stream starts on versus the one it inherits. A negative
+     * gap is the healthy case (the new stream is already ahead). */
+    if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)) {
+      GST_INFO_OBJECT (data->element, "First buffer out"
+          ", PTS: %" GST_TIME_FORMAT
+          ", DTS: %" GST_TIME_FORMAT
+          ", duration: %" GST_TIME_FORMAT
+          ", inherited last PTS: %" GST_TIME_FORMAT
+          ", gap (inherited - PTS): %s%" GST_TIME_FORMAT,
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (GST_BUFFER_DTS (buffer)),
+          GST_TIME_ARGS (GST_BUFFER_DURATION (buffer)),
+          GST_TIME_ARGS (tracker->last_pts),
+          (pts_current > tracker->last_pts) ? "-" : "",
+          GST_TIME_ARGS ((pts_current > tracker->last_pts)
+              ? (pts_current - tracker->last_pts)
+              : (tracker->last_pts - pts_current)));
+    }
+    else {
+      GST_INFO_OBJECT (data->element, "First buffer out"
+          ", PTS: %" GST_TIME_FORMAT
+          ", DTS: %" GST_TIME_FORMAT
+          ", duration: %" GST_TIME_FORMAT
+          ", no inherited PTS (fresh tracker)",
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (GST_BUFFER_DTS (buffer)),
+          GST_TIME_ARGS (GST_BUFFER_DURATION (buffer)));
+    }
+  }
+
   if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)
       && pts_current <= tracker->last_pts) {
     pts_fixed = tracker->last_pts + GST_MSECOND;
 
-    GST_WARNING_OBJECT (data->element, "Fix PTS not strictly increasing"
+    if (data->clamped_count == 0) {
+      data->clamped_first_pts = pts_current;
+      data->clamped_first_fixed = pts_fixed;
+    }
+    data->clamped_count++;
+
+    /* Per-buffer detail only at DEBUG: a single SSRC change can produce
+     * thousands of these, which drowns out everything else in the log. The
+     * summary below reports the run once it ends. */
+    GST_DEBUG_OBJECT (data->element, "Fix PTS not strictly increasing"
         ", last: %" GST_TIME_FORMAT
         ", current: %" GST_TIME_FORMAT
-        ", fixed = last + 1: %" GST_TIME_FORMAT,
+        ", fixed = last + 1ms: %" GST_TIME_FORMAT,
         GST_TIME_ARGS (tracker->last_pts),
         GST_TIME_ARGS (pts_current),
         GST_TIME_ARGS (pts_fixed));
 
     GST_BUFFER_PTS (buffer) = pts_fixed;
+  }
+  else if (data->clamped_count > 0) {
+    /* First buffer that needed no fixing: the run has converged. */
+    GST_INFO_OBJECT (data->element, "PTS clamping ended"
+        ", buffers clamped: %" G_GUINT64_FORMAT
+        ", incoming PTS spanned: %" GST_TIME_FORMAT " -> %" GST_TIME_FORMAT
+        ", emitted PTS spanned: %" GST_TIME_FORMAT " -> %" GST_TIME_FORMAT,
+        data->clamped_count,
+        GST_TIME_ARGS (data->clamped_first_pts),
+        GST_TIME_ARGS (pts_current),
+        GST_TIME_ARGS (data->clamped_first_fixed),
+        GST_TIME_ARGS (pts_fixed));
+
+    data->clamped_count = 0;
   }
 
   GST_TRACE_OBJECT (data->element, "Adjust output DTS"
