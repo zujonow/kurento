@@ -1518,6 +1518,16 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
   GstClockTime pts_fixed = pts_current;
   KmsPtsTracker *tracker = data->tracker;
 
+  /* A buffer with no PTS must not reach the tracker. GST_CLOCK_TIME_NONE is
+   * G_MAXUINT64, so it would pass the "strictly increasing" test below and
+   * then be stored as last_pts, after which every GST_CLOCK_TIME_IS_VALID()
+   * check fails and the whole mechanism silently stops working for the rest of
+   * the endpoint's life. Leave such a buffer alone. */
+  if (!GST_CLOCK_TIME_IS_VALID (pts_current)) {
+    GST_DEBUG_OBJECT (data->element, "Buffer has no PTS; leaving it untouched");
+    return;
+  }
+
   /* The tracker may be shared with another depayloader across an SSRC
    * change, so the read-modify-write below has to be atomic. */
   g_mutex_lock (&tracker->mutex);
