@@ -1419,6 +1419,18 @@ set_func:
  * Sharing this state through a tracker lets the replacement carry on from
  * where its predecessor left off.
  */
+/* Smallest forward step when output PTS has to be pushed past what was already
+ * emitted. Only used to break a tie, not to pace the stream. */
+#define PTS_MIN_STEP (GST_MSECOND)
+
+/* How fast a rebase offset is given back, per buffer. This is the whole
+ * trade-off: output advances (packet duration - drift) per packet, so
+ * downstream loses drift/duration of the audio and the offset closes in
+ * (gap / drift) packets. At 1ms against 20ms packets that is 5% and, for a
+ * 2.3s gap, about 46 seconds. Raising it converges faster and costs more;
+ * setting it to 0 rebases permanently and never converges. */
+#define PTS_OFFSET_DRIFT (GST_MSECOND)
+
 struct _KmsPtsTracker
 {
   gint refcount;
@@ -1480,14 +1492,18 @@ typedef struct _AdjustPtsData
   GstElement *element;
   KmsPtsTracker *tracker;       /* owned */
 
-  /* Diagnostics. A depayloader is rebuilt on every attach, so this struct is
-   * fresh per branch: `seen_first` is therefore exactly "the first buffer after
-   * an SSRC switch", the moment that reveals how far back the new stream's
-   * timeline starts. All of it is touched only under tracker->mutex. */
+  /* Added to every outgoing PTS, then unwound a little per buffer. A
+   * depayloader is rebuilt on every attach, so this struct is fresh per branch
+   * and each one establishes and unwinds its own offset. */
+  GstClockTime offset;
+  GstClockTime offset_initial;  /* what it started at, for the closing log */
+  guint64 offset_buffers;       /* buffers carried since it was established */
+
+  /* Diagnostics. `seen_first` is exactly "the first buffer after an SSRC
+   * switch", the moment that reveals where the new stream's timeline starts.
+   * All of it is touched only under tracker->mutex. */
   gboolean seen_first;
   guint64 clamped_count;
-  GstClockTime clamped_first_pts;       /* incoming PTS that started the run */
-  GstClockTime clamped_first_fixed;     /* what it was rewritten to */
 } AdjustPtsData;
 
 static void
@@ -1566,42 +1582,75 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
     }
   }
 
-  if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)
-      && pts_current <= tracker->last_pts) {
-    pts_fixed = tracker->last_pts + GST_MSECOND;
+  /* Give back a little of the offset on every buffer, so that a stream rebased
+   * over a predecessor that ran ahead of the clock drifts back to real time
+   * instead of staying ahead of it forever. */
+  if (data->offset > 0) {
+    data->offset -= MIN (data->offset, PTS_OFFSET_DRIFT);
+    data->offset_buffers++;
 
-    if (data->clamped_count == 0) {
-      data->clamped_first_pts = pts_current;
-      data->clamped_first_fixed = pts_fixed;
+    if (data->offset == 0) {
+      GST_INFO_OBJECT (data->element, "PTS offset unwound"
+          ", was: %" GST_TIME_FORMAT
+          ", buffers taken: %" G_GUINT64_FORMAT
+          ", buffers clamped: %" G_GUINT64_FORMAT,
+          GST_TIME_ARGS (data->offset_initial),
+          data->offset_buffers, data->clamped_count);
     }
-    data->clamped_count++;
-
-    /* Per-buffer detail only at DEBUG: a single SSRC change can produce
-     * thousands of these, which drowns out everything else in the log. The
-     * summary below reports the run once it ends. */
-    GST_DEBUG_OBJECT (data->element, "Fix PTS not strictly increasing"
-        ", last: %" GST_TIME_FORMAT
-        ", current: %" GST_TIME_FORMAT
-        ", fixed = last + 1ms: %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (tracker->last_pts),
-        GST_TIME_ARGS (pts_current),
-        GST_TIME_ARGS (pts_fixed));
-
-    GST_BUFFER_PTS (buffer) = pts_fixed;
   }
-  else if (data->clamped_count > 0) {
-    /* First buffer that needed no fixing: the run has converged. */
-    GST_INFO_OBJECT (data->element, "PTS clamping ended"
-        ", buffers clamped: %" G_GUINT64_FORMAT
-        ", incoming PTS spanned: %" GST_TIME_FORMAT " -> %" GST_TIME_FORMAT
-        ", emitted PTS spanned: %" GST_TIME_FORMAT " -> %" GST_TIME_FORMAT,
-        data->clamped_count,
-        GST_TIME_ARGS (data->clamped_first_pts),
-        GST_TIME_ARGS (pts_current),
-        GST_TIME_ARGS (data->clamped_first_fixed),
-        GST_TIME_ARGS (pts_fixed));
 
-    data->clamped_count = 0;
+  pts_fixed = pts_current + data->offset;
+
+  if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)
+      && pts_fixed <= tracker->last_pts) {
+    const GstClockTime offset_was = data->offset;
+
+    /* Not strictly increasing even with the current offset. Rebase onto what
+     * was already emitted. On the first buffer after an SSRC change this is
+     * what establishes the offset; later it is the floor that still catches a
+     * regression within a single stream, which is what this mechanism was
+     * originally for. */
+    pts_fixed = tracker->last_pts + PTS_MIN_STEP;
+    data->offset = pts_fixed - pts_current;
+
+    if (offset_was == 0) {
+      data->offset_initial = data->offset;
+      data->offset_buffers = 0;
+      data->clamped_count = 0;
+
+      /* State up front what this will cost, so a log does not have to be
+       * measured after the fact to find out. */
+      GST_INFO_OBJECT (data->element, "PTS rebased onto previous stream"
+          ", incoming PTS: %" GST_TIME_FORMAT
+          ", already emitted: %" GST_TIME_FORMAT
+          ", offset applied: %" GST_TIME_FORMAT
+          ", unwinding at %" GST_TIME_FORMAT " per buffer"
+          " (~%" G_GUINT64_FORMAT " buffers)",
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (tracker->last_pts),
+          GST_TIME_ARGS (data->offset),
+          GST_TIME_ARGS ((GstClockTime) PTS_OFFSET_DRIFT),
+          (guint64) (PTS_OFFSET_DRIFT > 0
+              ? (data->offset / PTS_OFFSET_DRIFT) : 0));
+    }
+    else {
+      /* Per-buffer detail only at DEBUG: at a large drift this can fire for
+       * thousands of buffers and drown out everything else. */
+      GST_DEBUG_OBJECT (data->element, "Fix PTS not strictly increasing"
+          ", last: %" GST_TIME_FORMAT
+          ", current: %" GST_TIME_FORMAT
+          ", fixed = last + %" GST_TIME_FORMAT ": %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (tracker->last_pts),
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS ((GstClockTime) PTS_MIN_STEP),
+          GST_TIME_ARGS (pts_fixed));
+    }
+
+    data->clamped_count++;
+  }
+
+  if (pts_fixed != pts_current) {
+    GST_BUFFER_PTS (buffer) = pts_fixed;
   }
 
   GST_TRACE_OBJECT (data->element, "Adjust output DTS"
