@@ -90,6 +90,13 @@ RTP or SRTP protocols.
               "type": "boolean",
               "optional": true,
               "defaultValue": false
+            },
+            {
+              "name": "listenDtmf",
+              "doc": "This configures the endpoint to listen for DTMF tones.",
+              "type": "boolean",
+              "optional": true,
+              "defaultValue": false
             }
           ]
         },

@@ -30,8 +30,8 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 G_DEFINE_TYPE (KmsSrtpSession, kms_srtp_session, KMS_TYPE_BASE_RTP_SESSION);
 
 KmsSrtpSession *
-kms_srtp_session_new (KmsBaseSdpEndpoint * ep, guint id,
-    KmsIRtpSessionManager * manager, gboolean use_ipv6)
+kms_srtp_session_new (KmsBaseSdpEndpoint *ep, guint id,
+    KmsIRtpSessionManager *manager, gboolean use_ipv6, gboolean listen_dtmf)
 {
   GObject *obj;
   KmsSrtpSession *self;
@@ -39,7 +39,7 @@ kms_srtp_session_new (KmsBaseSdpEndpoint * ep, guint id,
   obj = g_object_new (KMS_TYPE_SRTP_SESSION, NULL);
   self = KMS_SRTP_SESSION (obj);
   KMS_SRTP_SESSION_CLASS (G_OBJECT_GET_CLASS (self))->post_constructor
-      (self, ep, id, manager, use_ipv6);
+      (self, ep, id, manager, use_ipv6, listen_dtmf);
 
   return self;
 }
@@ -47,8 +47,8 @@ kms_srtp_session_new (KmsBaseSdpEndpoint * ep, guint id,
 /* Connection management begin */
 
 KmsRtpBaseConnection *
-kms_srtp_session_get_connection (KmsSrtpSession * self,
-    KmsSdpMediaHandler * handler)
+kms_srtp_session_get_connection (KmsSrtpSession *self,
+    KmsSdpMediaHandler *handler)
 {
   KmsBaseRtpSession *base_rtp_sess = KMS_BASE_RTP_SESSION (self);
   KmsIRtpConnection *conn;
@@ -62,8 +62,8 @@ kms_srtp_session_get_connection (KmsSrtpSession * self,
 }
 
 static KmsIRtpConnection *
-kms_srtp_session_create_connection (KmsBaseRtpSession * base_rtp_sess,
-    const GstSDPMedia * media, const gchar * name, guint16 min_port,
+kms_srtp_session_create_connection (KmsBaseRtpSession *base_rtp_sess,
+    const GstSDPMedia *media, const gchar *name, guint16 min_port,
     guint16 max_port)
 {
   KmsSrtpConnection *conn = kms_srtp_connection_new (min_port, max_port,
@@ -75,25 +75,26 @@ kms_srtp_session_create_connection (KmsBaseRtpSession * base_rtp_sess,
 /* Connection management end */
 
 static void
-kms_srtp_session_post_constructor (KmsSrtpSession * self,
-    KmsBaseSdpEndpoint * ep, guint id, KmsIRtpSessionManager * manager,
-    gboolean use_ipv6)
+kms_srtp_session_post_constructor (KmsSrtpSession *self,
+    KmsBaseSdpEndpoint *ep, guint id, KmsIRtpSessionManager *manager,
+    gboolean use_ipv6, gboolean listen_dtmf)
 {
   KmsBaseRtpSession *base_rtp_session = KMS_BASE_RTP_SESSION (self);
 
   self->use_ipv6 = use_ipv6;
+  self->listen_dtmf = listen_dtmf;
   KMS_BASE_RTP_SESSION_CLASS (parent_class)->post_constructor (base_rtp_session,
       ep, id, manager);
 }
 
 static void
-kms_srtp_session_init (KmsSrtpSession * self)
+kms_srtp_session_init (KmsSrtpSession *self)
 {
   /* nothing to do */
 }
 
 static void
-kms_srtp_session_class_init (KmsSrtpSessionClass * klass)
+kms_srtp_session_class_init (KmsSrtpSessionClass *klass)
 {
   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);
   KmsBaseRtpSessionClass *base_rtp_session_class;

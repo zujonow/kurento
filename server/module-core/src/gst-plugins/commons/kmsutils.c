@@ -1411,26 +1411,125 @@ set_func:
 
 // ------------------------ Adjust PTS ------------------------
 
+/* A depayloader normally owns its last-PTS state. But when a remote peer
+ * changes its SSRC mid-session, the depayloader is replaced by a new one
+ * (see kms_base_rtp_endpoint_rtpbin_pad_added). A fresh depayloader has no
+ * history, so on its own it cannot keep the output PTS strictly increasing
+ * across the switch, and downstream elements then drop buffers or stall.
+ * Sharing this state through a tracker lets the replacement carry on from
+ * where its predecessor left off.
+ */
+/* Smallest forward step when output PTS has to be pushed past what was already
+ * emitted. Only used to break a tie, not to pace the stream. */
+#define PTS_MIN_STEP (GST_MSECOND)
+
+/* How fast a rebase offset is given back, per buffer. This is the whole
+ * trade-off: output advances (packet duration - drift) per packet, so
+ * downstream loses drift/duration of the audio and the offset closes in
+ * (gap / drift) packets. At 1ms against 20ms packets that is 5% and, for a
+ * 2.3s gap, about 46 seconds. Raising it converges faster and costs more;
+ * setting it to 0 rebases permanently and never converges. */
+#define PTS_OFFSET_DRIFT (GST_MSECOND)
+
+struct _KmsPtsTracker
+{
+  gint refcount;
+  GMutex mutex;
+  GstClockTime last_pts;
+};
+
+KmsPtsTracker *
+kms_pts_tracker_new (void)
+{
+  KmsPtsTracker *tracker = g_slice_new0 (KmsPtsTracker);
+
+  tracker->refcount = 1;
+  g_mutex_init (&tracker->mutex);
+  tracker->last_pts = GST_CLOCK_TIME_NONE;
+
+  return tracker;
+}
+
+KmsPtsTracker *
+kms_pts_tracker_ref (KmsPtsTracker * tracker)
+{
+  g_return_val_if_fail (tracker != NULL, NULL);
+
+  g_atomic_int_inc (&tracker->refcount);
+
+  return tracker;
+}
+
+void
+kms_pts_tracker_unref (KmsPtsTracker * tracker)
+{
+  if (tracker == NULL) {
+    return;
+  }
+
+  if (g_atomic_int_dec_and_test (&tracker->refcount)) {
+    g_mutex_clear (&tracker->mutex);
+    g_slice_free (KmsPtsTracker, tracker);
+  }
+}
+
+GstClockTime
+kms_pts_tracker_peek_last (KmsPtsTracker * tracker)
+{
+  GstClockTime last_pts;
+
+  g_return_val_if_fail (tracker != NULL, GST_CLOCK_TIME_NONE);
+
+  g_mutex_lock (&tracker->mutex);
+  last_pts = tracker->last_pts;
+  g_mutex_unlock (&tracker->mutex);
+
+  return last_pts;
+}
+
 typedef struct _AdjustPtsData
 {
   GstElement *element;
-  GstClockTime last_pts;
+  KmsPtsTracker *tracker;       /* owned */
+
+  /* Added to every outgoing PTS, then unwound a little per buffer. A
+   * depayloader is rebuilt on every attach, so this struct is fresh per branch
+   * and each one establishes and unwinds its own offset. */
+  GstClockTime offset;
+  GstClockTime offset_initial;  /* what it started at, for the closing log */
+  guint64 offset_buffers;       /* buffers carried since it was established */
+  GstClockTime absorbed;        /* of offset_initial, how much cost no audio */
+
+  /* End of the previous incoming buffer (its PTS plus its duration), or
+   * GST_CLOCK_TIME_NONE when that could not be determined. Anything beyond it
+   * is a gap in the stream: time in which nothing has to be emitted. */
+  GstClockTime prev_in_end;
+
+  /* Diagnostics. `seen_first` is exactly "the first buffer after an SSRC
+   * switch", the moment that reveals where the new stream's timeline starts.
+   * All of it is touched only under tracker->mutex. */
+  gboolean seen_first;
+  guint64 clamped_count;
 } AdjustPtsData;
 
 static void
 kms_utils_adjust_pts_data_destroy (AdjustPtsData * data)
 {
+  kms_pts_tracker_unref (data->tracker);
   g_slice_free (AdjustPtsData, data);
 }
 
 static AdjustPtsData *
-kms_utils_adjust_pts_data_new (GstElement * element)
+kms_utils_adjust_pts_data_new (GstElement * element, KmsPtsTracker * tracker)
 {
   AdjustPtsData *data;
 
   data = g_slice_new0 (AdjustPtsData);
   data->element = element;
-  data->last_pts = GST_CLOCK_TIME_NONE;
+  data->prev_in_end = GST_CLOCK_TIME_NONE;
+  /* No tracker given: this depayloader keeps its own private state. */
+  data->tracker = (tracker != NULL) ? kms_pts_tracker_ref (tracker)
+      : kms_pts_tracker_new ();
 
   return data;
 }
@@ -1439,20 +1538,158 @@ static void
 kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
 {
   const GstClockTime pts_current = GST_BUFFER_PTS (buffer);
+  const GstClockTime duration = GST_BUFFER_DURATION (buffer);
   GstClockTime pts_fixed = pts_current;
+  GstClockTime offset_at_entry;
+  KmsPtsTracker *tracker = data->tracker;
 
-  if (GST_CLOCK_TIME_IS_VALID (data->last_pts)
-      && pts_current <= data->last_pts) {
-    pts_fixed = data->last_pts + GST_MSECOND;
+  /* A buffer with no PTS must not reach the tracker. GST_CLOCK_TIME_NONE is
+   * G_MAXUINT64, so it would pass the "strictly increasing" test below and
+   * then be stored as last_pts, after which every GST_CLOCK_TIME_IS_VALID()
+   * check fails and the whole mechanism silently stops working for the rest of
+   * the endpoint's life. Leave such a buffer alone. */
+  if (!GST_CLOCK_TIME_IS_VALID (pts_current)) {
+    GST_DEBUG_OBJECT (data->element, "Buffer has no PTS; leaving it untouched");
+    return;
+  }
 
-    GST_WARNING_OBJECT (data->element, "Fix PTS not strictly increasing"
-        ", last: %" GST_TIME_FORMAT
-        ", current: %" GST_TIME_FORMAT
-        ", fixed = last + 1: %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (data->last_pts),
-        GST_TIME_ARGS (pts_current),
-        GST_TIME_ARGS (pts_fixed));
+  /* The tracker may be shared with another depayloader across an SSRC
+   * change, so the read-modify-write below has to be atomic. */
+  g_mutex_lock (&tracker->mutex);
 
+  if (!data->seen_first) {
+    data->seen_first = TRUE;
+
+    /* One line per branch, at the only moment that carries the answer: what
+     * timeline this stream starts on versus the one it inherits. A negative
+     * gap is the healthy case (the new stream is already ahead). */
+    if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)) {
+      GST_INFO_OBJECT (data->element, "First buffer out"
+          ", PTS: %" GST_TIME_FORMAT
+          ", DTS: %" GST_TIME_FORMAT
+          ", duration: %" GST_TIME_FORMAT
+          ", inherited last PTS: %" GST_TIME_FORMAT
+          ", gap (inherited - PTS): %s%" GST_TIME_FORMAT,
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (GST_BUFFER_DTS (buffer)),
+          GST_TIME_ARGS (GST_BUFFER_DURATION (buffer)),
+          GST_TIME_ARGS (tracker->last_pts),
+          (pts_current > tracker->last_pts) ? "-" : "",
+          GST_TIME_ARGS ((pts_current > tracker->last_pts)
+              ? (pts_current - tracker->last_pts)
+              : (tracker->last_pts - pts_current)));
+    }
+    else {
+      GST_INFO_OBJECT (data->element, "First buffer out"
+          ", PTS: %" GST_TIME_FORMAT
+          ", DTS: %" GST_TIME_FORMAT
+          ", duration: %" GST_TIME_FORMAT
+          ", no inherited PTS (fresh tracker)",
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (GST_BUFFER_DTS (buffer)),
+          GST_TIME_ARGS (GST_BUFFER_DURATION (buffer)));
+    }
+  }
+
+  offset_at_entry = data->offset;
+
+  /* Free catch-up. A gap in the incoming stream is time in which nothing has
+   * to be emitted, so closing it gives the offset back without shortening any
+   * audio at all. Silence suppression, comfort noise and packet loss all
+   * produce these, which is why this converges far faster than the drift below
+   * on real speech. Only attempted when the previous buffer's duration was
+   * known -- without it every packet would look like a gap the size of itself,
+   * and the whole offset would be absorbed into overlapping audio. */
+  if (data->offset > 0 && GST_CLOCK_TIME_IS_VALID (data->prev_in_end)
+      && pts_current > data->prev_in_end) {
+    const GstClockTime gap = pts_current - data->prev_in_end;
+    const GstClockTime taken = MIN (data->offset, gap);
+
+    data->offset -= taken;
+    data->absorbed += taken;
+
+    GST_DEBUG_OBJECT (data->element, "Absorbed PTS offset into a gap"
+        ", gap: %" GST_TIME_FORMAT
+        ", taken: %" GST_TIME_FORMAT
+        ", offset left: %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (gap), GST_TIME_ARGS (taken),
+        GST_TIME_ARGS (data->offset));
+  }
+
+  /* Paid catch-up. Shortens each packet slightly, so downstream loses
+   * drift/duration of the audio. Only reached when the stream offers no gaps
+   * to absorb. */
+  if (data->offset > 0) {
+    data->offset -= MIN (data->offset, PTS_OFFSET_DRIFT);
+  }
+
+  if (offset_at_entry > 0) {
+    data->offset_buffers++;
+
+    if (data->offset == 0) {
+      GST_INFO_OBJECT (data->element, "PTS offset unwound"
+          ", was: %" GST_TIME_FORMAT
+          ", absorbed into gaps: %" GST_TIME_FORMAT
+          ", buffers taken: %" G_GUINT64_FORMAT
+          ", buffers clamped: %" G_GUINT64_FORMAT,
+          GST_TIME_ARGS (data->offset_initial),
+          GST_TIME_ARGS (data->absorbed),
+          data->offset_buffers, data->clamped_count);
+    }
+  }
+
+  pts_fixed = pts_current + data->offset;
+
+  if (GST_CLOCK_TIME_IS_VALID (tracker->last_pts)
+      && pts_fixed <= tracker->last_pts) {
+    const GstClockTime offset_was = data->offset;
+
+    /* Not strictly increasing even with the current offset. Rebase onto what
+     * was already emitted. On the first buffer after an SSRC change this is
+     * what establishes the offset; later it is the floor that still catches a
+     * regression within a single stream, which is what this mechanism was
+     * originally for. */
+    pts_fixed = tracker->last_pts + PTS_MIN_STEP;
+    data->offset = pts_fixed - pts_current;
+
+    if (offset_was == 0) {
+      data->offset_initial = data->offset;
+      data->offset_buffers = 0;
+      data->clamped_count = 0;
+      data->absorbed = 0;
+
+      /* State up front what this will cost, so a log does not have to be
+       * measured after the fact to find out. */
+      GST_INFO_OBJECT (data->element, "PTS rebased onto previous stream"
+          ", incoming PTS: %" GST_TIME_FORMAT
+          ", already emitted: %" GST_TIME_FORMAT
+          ", offset applied: %" GST_TIME_FORMAT
+          ", unwinding at %" GST_TIME_FORMAT " per buffer"
+          " (~%" G_GUINT64_FORMAT " buffers, sooner if the stream has gaps)",
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS (tracker->last_pts),
+          GST_TIME_ARGS (data->offset),
+          GST_TIME_ARGS ((GstClockTime) PTS_OFFSET_DRIFT),
+          (guint64) (PTS_OFFSET_DRIFT > 0
+              ? (data->offset / PTS_OFFSET_DRIFT) : 0));
+    }
+    else {
+      /* Per-buffer detail only at DEBUG: at a large drift this can fire for
+       * thousands of buffers and drown out everything else. */
+      GST_DEBUG_OBJECT (data->element, "Fix PTS not strictly increasing"
+          ", last: %" GST_TIME_FORMAT
+          ", current: %" GST_TIME_FORMAT
+          ", fixed = last + %" GST_TIME_FORMAT ": %" GST_TIME_FORMAT,
+          GST_TIME_ARGS (tracker->last_pts),
+          GST_TIME_ARGS (pts_current),
+          GST_TIME_ARGS ((GstClockTime) PTS_MIN_STEP),
+          GST_TIME_ARGS (pts_fixed));
+    }
+
+    data->clamped_count++;
+  }
+
+  if (pts_fixed != pts_current) {
     GST_BUFFER_PTS (buffer) = pts_fixed;
   }
 
@@ -1463,7 +1700,14 @@ kms_utils_depayloader_adjust_pts_out (AdjustPtsData * data, GstBuffer * buffer)
       GST_TIME_ARGS (pts_fixed));
 
   GST_BUFFER_DTS (buffer) = pts_fixed;
-  data->last_pts = pts_fixed;
+  tracker->last_pts = pts_fixed;
+
+  /* Deliberately the INCOMING timeline, not the emitted one: the gap test asks
+   * what the sender left empty, which the offset must not distort. */
+  data->prev_in_end = GST_CLOCK_TIME_IS_VALID (duration)
+      ? (pts_current + duration) : GST_CLOCK_TIME_NONE;
+
+  g_mutex_unlock (&tracker->mutex);
 }
 
 static gboolean
@@ -1500,7 +1744,8 @@ kms_utils_depayloader_pts_out_probe (GstPad * pad, GstPadProbeInfo * info,
 }
 
 void
-kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
+kms_utils_depayloader_monitor_pts_out_tracked (GstElement * depayloader,
+    KmsPtsTracker * tracker)
 {
   GstPad *src_pad;
 
@@ -1510,9 +1755,15 @@ kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
   gst_pad_add_probe (src_pad,
       GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
       (GstPadProbeCallback) kms_utils_depayloader_pts_out_probe,
-      kms_utils_adjust_pts_data_new (depayloader),
+      kms_utils_adjust_pts_data_new (depayloader, tracker),
       (GDestroyNotify) kms_utils_adjust_pts_data_destroy);
   g_object_unref (src_pad);
+}
+
+void
+kms_utils_depayloader_monitor_pts_out (GstElement * depayloader)
+{
+  kms_utils_depayloader_monitor_pts_out_tracked (depayloader, NULL);
 }
 
 int

@@ -45,16 +45,16 @@ namespace kurento
 
 RtpEndpointImpl::RtpEndpointImpl (const boost::property_tree::ptree &conf,
                                   std::shared_ptr<MediaPipeline> mediaPipeline,
-                                  std::shared_ptr<SDES> crypto, bool useIpv6)
+                                  std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf)
   : BaseRtpEndpointImpl (conf,
                          std::dynamic_pointer_cast<MediaObjectImpl> (mediaPipeline),
-                         FACTORY_NAME, useIpv6)
+                         FACTORY_NAME, useIpv6, listenDtmf)
 {
   if (!crypto->isSetCrypto() ) {
     return;
   }
 
-  if (!crypto->isSetKey() && !crypto->isSetKeyBase64()) {
+  if (!crypto->isSetKey() && !crypto->isSetKeyBase64() ) {
     /* Use random key */
     g_object_set (element, "crypto-suite", crypto->getCrypto()->getValue(),
                   NULL);
@@ -68,10 +68,12 @@ RtpEndpointImpl::RtpEndpointImpl (const boost::property_tree::ptree &conf,
   case CryptoSuite::AES_128_CM_HMAC_SHA1_80:
     expect_size = KMS_SRTP_CIPHER_AES_CM_128_SIZE;
     break;
+
   case CryptoSuite::AES_256_CM_HMAC_SHA1_32:
   case CryptoSuite::AES_256_CM_HMAC_SHA1_80:
     expect_size = KMS_SRTP_CIPHER_AES_CM_256_SIZE;
     break;
+
   default:
     throw KurentoException (MEDIA_OBJECT_ILLEGAL_PARAM_ERROR,
                             "Invalid crypto suite");
@@ -80,29 +82,30 @@ RtpEndpointImpl::RtpEndpointImpl (const boost::property_tree::ptree &conf,
   std::string key_b64;
   gsize key_data_size = 0;
 
-  if (crypto->isSetKey()) {
+  if (crypto->isSetKey() ) {
     std::string tmp = crypto->getKey();
     key_data_size = tmp.length();
 
-    gchar *tmp_b64 = g_base64_encode ((const guchar *)tmp.data(), tmp.length());
+    gchar *tmp_b64 = g_base64_encode ( (const guchar *) tmp.data(), tmp.length() );
     key_b64 = std::string (tmp_b64);
-    g_free(tmp_b64);
-  }
-  else if (crypto->isSetKeyBase64()) {
+    g_free (tmp_b64);
+  } else if (crypto->isSetKeyBase64() ) {
     key_b64 = crypto->getKeyBase64();
     guchar *tmp_b64 = g_base64_decode (key_b64.data(), &key_data_size);
+
     if (!tmp_b64) {
       GST_ERROR_OBJECT (element, "Master key is not valid Base64");
       throw KurentoException (MEDIA_OBJECT_ILLEGAL_PARAM_ERROR,
                               "Master key is not valid Base64");
     }
+
     g_free (tmp_b64);
   }
 
   if (key_data_size != expect_size) {
     GST_ERROR_OBJECT (element,
-        "Bad Base64-decoded master key size: got %lu, expected %lu",
-        key_data_size, expect_size);
+                      "Bad Base64-decoded master key size: got %lu, expected %lu",
+                      key_data_size, expect_size);
     throw KurentoException (MEDIA_OBJECT_ILLEGAL_PARAM_ERROR,
                             "Master key size is wrong");
   }
@@ -138,11 +141,11 @@ RtpEndpointImpl::onKeySoftLimit (gchar *media)
   std::shared_ptr<MediaType> type;
 
   if (g_strcmp0 (media, "audio") == 0) {
-    type = std::make_shared<MediaType>(MediaType::AUDIO);
+    type = std::make_shared<MediaType> (MediaType::AUDIO);
   } else if (g_strcmp0 (media, "video") == 0) {
-    type = std::make_shared<MediaType>(MediaType::VIDEO);
+    type = std::make_shared<MediaType> (MediaType::VIDEO);
   } else if (g_strcmp0 (media, "data") == 0) {
-    type = std::make_shared<MediaType>(MediaType::DATA);
+    type = std::make_shared<MediaType> (MediaType::DATA);
   } else {
     GST_ERROR ("Unsupported media %s", media);
     return;
@@ -150,21 +153,21 @@ RtpEndpointImpl::onKeySoftLimit (gchar *media)
 
   try {
     OnKeySoftLimit event (shared_from_this (), OnKeySoftLimit::getName (),
-        type);
-    sigcSignalEmit(signalOnKeySoftLimit, event);
+                          type);
+    sigcSignalEmit (signalOnKeySoftLimit, event);
   } catch (const std::bad_weak_ptr &e) {
     // shared_from_this()
     GST_ERROR ("BUG creating %s: %s", OnKeySoftLimit::getName ().c_str (),
-        e.what ());
+               e.what () );
   }
 }
 
 MediaObjectImpl *
 RtpEndpointImplFactory::createObject (const boost::property_tree::ptree &conf,
                                       std::shared_ptr<MediaPipeline> mediaPipeline,
-                                      std::shared_ptr<SDES> crypto, bool useIpv6) const
+                                      std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf) const
 {
-  return new RtpEndpointImpl (conf, mediaPipeline, crypto, useIpv6);
+  return new RtpEndpointImpl (conf, mediaPipeline, crypto, useIpv6, listenDtmf);
 }
 
 RtpEndpointImpl::StaticConstructor RtpEndpointImpl::staticConstructor;

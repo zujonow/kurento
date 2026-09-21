@@ -570,6 +570,221 @@ test_audio_sendrecv (const gchar * audio_enc_name,
   g_free (answerer_sess_id);
 }
 
+/* SSRC change test */
+
+/* Reproduces a remote that starts sending a new RTP SSRC on an established
+ * session. Asterisk does this on bridge joins and transfers, without any
+ * accompanying signalling, and the capture that motivated this test shows the
+ * old SSRC simply stopping and a new one taking over on the same 5-tuple.
+ *
+ * rtpbin exposes a second "recv_rtp_src_0_<ssrc>_<pt>" pad for it. Kurento
+ * used to build a second depayloader, fail to link it to the agnosticbin
+ * (whose sink is a single always pad, already taken), and leave the rtpbin pad
+ * unlinked. Upstream then reported GST_FLOW_NOT_LINKED and the pipeline died
+ * with "Internal data stream error", which bus_msg() turns into a failure
+ * here. It must now switch over to the new SSRC and keep the audio flowing.
+ */
+
+#define SSRC_CHANGE_NEW_SSRC 0x4F0417EFu
+#define SSRC_CHANGE_BUFFERS 50
+
+typedef struct _SsrcChangeData
+{
+  GMainLoop *loop;
+  GstElement *injector;         /* second RTP source, different SSRC */
+  guint recv_port;
+  gboolean injecting;
+  guint buffers;
+} SsrcChangeData;
+
+/* A standalone RTP sender aimed at `port`, stamping every packet with `ssrc`.
+ * 160 samples per buffer is 20 ms of PCMU, i.e. ordinary packetisation, so the
+ * tests see a realistic 50 packets per second. */
+static GstElement *
+ssrc_start_injector (guint ssrc, guint port)
+{
+  GError *err = NULL;
+  GstElement *injector;
+  gchar *desc;
+
+  desc = g_strdup_printf ("audiotestsrc is-live=true samplesperbuffer=160"
+      " ! audio/x-raw,rate=8000,channels=1"
+      " ! mulawenc ! rtppcmupay ssrc=%u"
+      " ! udpsink host=127.0.0.1 port=%u sync=false async=false", ssrc, port);
+
+  GST_INFO ("Start SSRC %u towards port %u", ssrc, port);
+
+  injector = gst_parse_launch (desc, &err);
+  g_free (desc);
+
+  fail_unless (err == NULL, "Cannot build the SSRC injector: %s",
+      (err != NULL) ? err->message : "");
+  fail_unless (injector != NULL);
+
+  gst_element_set_state (injector, GST_STATE_PLAYING);
+
+  return injector;
+}
+
+static void
+ssrc_stop_injector (GstElement **injector)
+{
+  if (*injector == NULL) {
+    return;
+  }
+
+  gst_element_set_state (*injector, GST_STATE_NULL);
+  g_clear_object (injector);
+}
+
+static gboolean
+ssrc_change_start_injector (gpointer user_data)
+{
+  SsrcChangeData *data = user_data;
+
+  data->injector = ssrc_start_injector (SSRC_CHANGE_NEW_SSRC, data->recv_port);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+ssrc_change_hand_off (GstElement * fakesink, GstBuffer * buf, GstPad * pad,
+    gpointer user_data)
+{
+  SsrcChangeData *data = user_data;
+
+  if (!data->injecting) {
+    /* The first SSRC is being received; now add a second one. Starting it
+     * from an idle source keeps this streaming thread free. */
+    data->injecting = TRUE;
+    g_idle_add (ssrc_change_start_injector, data);
+    return;
+  }
+
+  /* Audio has to keep arriving once the new SSRC shows up */
+  if (++data->buffers >= SSRC_CHANGE_BUFFERS) {
+    g_object_set (G_OBJECT (fakesink), "signal-handoffs", FALSE, NULL);
+    g_idle_add (quit_main_loop_idle, data->loop);
+  }
+}
+
+GST_START_TEST (test_audio_ssrc_change)
+{
+  gchar *codecs[] = { "PCMU/8000", NULL };
+  GArray *codecs_array;
+  SsrcChangeData data = { NULL, NULL, 0, FALSE, 0 };
+  GMainLoop *loop = g_main_loop_new (NULL, TRUE);
+  gchar *sender_sess_id, *receiver_sess_id;
+  GstSDPMessage *offer, *answer;
+  const GstSDPMedia *media;
+  GstElement *pipeline = gst_pipeline_new (NULL);
+  GstBus *bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+  GstElement *audiotestsrc = gst_element_factory_make ("audiotestsrc", NULL);
+  GstElement *capsfilter = gst_element_factory_make ("capsfilter", NULL);
+  GstElement *audio_enc = gst_element_factory_make ("mulawenc", NULL);
+  GstElement *rtpendpointsender =
+      gst_element_factory_make ("rtpendpoint", NULL);
+  GstElement *rtpendpointreceiver =
+      gst_element_factory_make ("rtpendpoint", NULL);
+  GstElement *outputfakesink = gst_element_factory_make ("fakesink", NULL);
+  GstCaps *raw_caps;
+  gboolean answer_ok;
+  guint id;
+
+  data.loop = loop;
+
+  gst_bus_add_signal_watch (bus);
+  g_signal_connect (bus, "message", G_CALLBACK (bus_msg), pipeline);
+
+  mark_point ();
+  codecs_array = create_codecs_array (codecs);
+  g_object_set (rtpendpointsender, "num-audio-medias", 1, "audio-codecs",
+      g_array_ref (codecs_array), NULL);
+  g_object_set (rtpendpointreceiver, "num-audio-medias", 1, "audio-codecs",
+      g_array_ref (codecs_array), NULL);
+  g_array_unref (codecs_array);
+
+  raw_caps = gst_caps_new_simple ("audio/x-raw", "rate", G_TYPE_INT, 8000,
+      "channels", G_TYPE_INT, 1, NULL);
+  g_object_set (capsfilter, "caps", raw_caps, NULL);
+  gst_caps_unref (raw_caps);
+
+  g_object_set (G_OBJECT (audiotestsrc), "is-live", TRUE, NULL);
+  g_object_set (G_OBJECT (outputfakesink), "signal-handoffs", TRUE,
+      "sync", FALSE, "async", FALSE, NULL);
+  g_signal_connect (G_OBJECT (outputfakesink), "handoff",
+      G_CALLBACK (ssrc_change_hand_off), &data);
+
+  gst_bin_add (GST_BIN (pipeline), rtpendpointsender);
+  connect_sink_async (rtpendpointsender, audiotestsrc, audio_enc, capsfilter,
+      pipeline, SINK_AUDIO_STREAM);
+
+  gst_bin_add (GST_BIN (pipeline), rtpendpointreceiver);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+
+  g_signal_emit_by_name (rtpendpointsender, "create-session", &sender_sess_id);
+  g_signal_emit_by_name (rtpendpointreceiver, "create-session",
+      &receiver_sess_id);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointsender, "generate-offer", sender_sess_id,
+      &offer);
+  fail_unless (offer != NULL);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointreceiver, "process-offer", receiver_sess_id,
+      offer, &answer);
+  fail_unless (answer != NULL);
+
+  /* The answer carries the receiver's own RTP port: that is where the
+   * second SSRC has to be injected. */
+  media = gst_sdp_message_get_media (answer, 0);
+  fail_unless (media != NULL);
+  data.recv_port = gst_sdp_media_get_port (media);
+  fail_unless (data.recv_port != 0);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointsender, "process-answer", sender_sess_id,
+      answer, &answer_ok);
+  fail_unless (answer_ok);
+  gst_sdp_message_free (offer);
+  gst_sdp_message_free (answer);
+
+  gst_bin_add (GST_BIN (pipeline), outputfakesink);
+  g_object_set_qdata (G_OBJECT (rtpendpointreceiver), audio_sink_quark (),
+      outputfakesink);
+  g_signal_connect (rtpendpointreceiver, "pad-added",
+      G_CALLBACK (connect_sink_on_srcpad_added), NULL);
+  fail_unless (kms_element_request_srcpad (rtpendpointreceiver,
+          KMS_ELEMENT_PAD_TYPE_AUDIO));
+
+  id = g_timeout_add_seconds (15, print_timedout_pipeline, pipeline);
+
+  mark_point ();
+  g_main_loop_run (loop);
+  mark_point ();
+
+  /* The loop is only left once audio kept flowing past the SSRC change */
+  fail_unless (data.injecting);
+  fail_unless (data.buffers >= SSRC_CHANGE_BUFFERS);
+
+  g_source_remove (id);
+
+  ssrc_stop_injector (&data.injector);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  gst_bus_remove_signal_watch (bus);
+  g_object_unref (bus);
+  g_main_loop_unref (loop);
+  g_object_unref (pipeline);
+  g_free (sender_sess_id);
+  g_free (receiver_sess_id);
+}
+
+GST_END_TEST;
+
 /* OPUS tests */
 
 static GstStaticCaps opus_expected_caps = GST_STATIC_CAPS ("audio/x-opus");
@@ -580,6 +795,200 @@ test_opus_sendonly (gboolean play_after_negotiation)
   test_audio_sendonly ("opusenc", opus_expected_caps, "OPUS/48000/1",
       play_after_negotiation);
 }
+
+/* A previously superseded SSRC starts sending again: A -> B -> A.
+ *
+ * This is the case a parked branch has to survive. When B took over, A's branch
+ * was detached and its pad left with nothing but a probe swallowing data. A
+ * then resumes -- and rtpbin does NOT raise "pad-added" for it, because A's
+ * source never timed out: it is sending. So nothing external will ever rebuild
+ * that branch, and unless the endpoint notices by itself, A's audio is dropped
+ * for good while its packets keep being counted.
+ *
+ * Unlike test_audio_ssrc_change, no media is connected to the sender: every
+ * packet here comes from a standalone injector, so that each SSRC can be
+ * stopped and started at will.
+ */
+#define SSRC_RETURN_SSRC_A 0x1A1A1A1Au
+#define SSRC_RETURN_SSRC_B 0x2B2B2B2Bu
+#define SSRC_RETURN_STEP_SECONDS 3
+
+typedef struct _SsrcReturnData
+{
+  GMainLoop *loop;
+  GstElement *injector;
+  guint recv_port;
+  guint buffers;                /* total buffers out of the receiver */
+  guint mark;                   /* buffer count at the last step */
+  guint step;
+  gboolean first_ssrc_flowed;
+  gboolean second_ssrc_flowed;
+  gboolean first_ssrc_resumed;  /* the point of the test */
+} SsrcReturnData;
+
+static void
+ssrc_return_hand_off (GstElement *fakesink, GstBuffer *buf, GstPad *pad,
+    gpointer user_data)
+{
+  SsrcReturnData *data = user_data;
+
+  data->buffers++;
+}
+
+/* Drives A -> B -> A on a timer rather than from the handoff: between stopping
+ * one SSRC and the next taking over there are no buffers at all, so there is
+ * nothing to drive it from. */
+static gboolean
+ssrc_return_step (gpointer user_data)
+{
+  SsrcReturnData *data = user_data;
+
+  switch (data->step) {
+    case 0:
+      /* A has had a few seconds to establish itself */
+      data->first_ssrc_flowed = (data->buffers > 0);
+      data->mark = data->buffers;
+
+      ssrc_stop_injector (&data->injector);
+      data->injector = ssrc_start_injector (SSRC_RETURN_SSRC_B,
+          data->recv_port);
+      break;
+
+    case 1:
+      /* The ordinary switchover, which already worked */
+      data->second_ssrc_flowed = (data->buffers > data->mark);
+      data->mark = data->buffers;
+
+      ssrc_stop_injector (&data->injector);
+      data->injector = ssrc_start_injector (SSRC_RETURN_SSRC_A,
+          data->recv_port);
+      break;
+
+    default:
+      /* The regression: A is sending again on a branch that was parked */
+      data->first_ssrc_resumed = (data->buffers > data->mark);
+      g_main_loop_quit (data->loop);
+
+      return G_SOURCE_REMOVE;
+  }
+
+  data->step++;
+
+  return G_SOURCE_CONTINUE;
+}
+
+GST_START_TEST (test_audio_ssrc_return)
+{
+  gchar *codecs[] = { "PCMU/8000", NULL };
+  GArray *codecs_array;
+  SsrcReturnData data = { 0 };
+  GMainLoop *loop = g_main_loop_new (NULL, TRUE);
+  gchar *sender_sess_id, *receiver_sess_id;
+  GstSDPMessage *offer, *answer;
+  const GstSDPMedia *media;
+  GstElement *pipeline = gst_pipeline_new (NULL);
+  GstBus *bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+  GstElement *rtpendpointsender =
+      gst_element_factory_make ("rtpendpoint", NULL);
+  GstElement *rtpendpointreceiver =
+      gst_element_factory_make ("rtpendpoint", NULL);
+  GstElement *outputfakesink = gst_element_factory_make ("fakesink", NULL);
+  gboolean answer_ok;
+  guint id, step_id;
+
+  data.loop = loop;
+
+  gst_bus_add_signal_watch (bus);
+  g_signal_connect (bus, "message", G_CALLBACK (bus_msg), pipeline);
+
+  mark_point ();
+  codecs_array = create_codecs_array (codecs);
+  g_object_set (rtpendpointsender, "num-audio-medias", 1, "audio-codecs",
+      g_array_ref (codecs_array), NULL);
+  g_object_set (rtpendpointreceiver, "num-audio-medias", 1, "audio-codecs",
+      g_array_ref (codecs_array), NULL);
+  g_array_unref (codecs_array);
+
+  g_object_set (G_OBJECT (outputfakesink), "signal-handoffs", TRUE,
+      "sync", FALSE, "async", FALSE, NULL);
+  g_signal_connect (G_OBJECT (outputfakesink), "handoff",
+      G_CALLBACK (ssrc_return_hand_off), &data);
+
+  /* The sender exists only to negotiate: it has no source of its own, so all
+   * the media in this test comes from the injectors. */
+  gst_bin_add (GST_BIN (pipeline), rtpendpointsender);
+  gst_bin_add (GST_BIN (pipeline), rtpendpointreceiver);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+
+  g_signal_emit_by_name (rtpendpointsender, "create-session", &sender_sess_id);
+  g_signal_emit_by_name (rtpendpointreceiver, "create-session",
+      &receiver_sess_id);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointsender, "generate-offer", sender_sess_id,
+      &offer);
+  fail_unless (offer != NULL);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointreceiver, "process-offer", receiver_sess_id,
+      offer, &answer);
+  fail_unless (answer != NULL);
+
+  media = gst_sdp_message_get_media (answer, 0);
+  fail_unless (media != NULL);
+  data.recv_port = gst_sdp_media_get_port (media);
+  fail_unless (data.recv_port != 0);
+
+  mark_point ();
+  g_signal_emit_by_name (rtpendpointsender, "process-answer", sender_sess_id,
+      answer, &answer_ok);
+  fail_unless (answer_ok);
+  gst_sdp_message_free (offer);
+  gst_sdp_message_free (answer);
+
+  gst_bin_add (GST_BIN (pipeline), outputfakesink);
+  g_object_set_qdata (G_OBJECT (rtpendpointreceiver), audio_sink_quark (),
+      outputfakesink);
+  g_signal_connect (rtpendpointreceiver, "pad-added",
+      G_CALLBACK (connect_sink_on_srcpad_added), NULL);
+  fail_unless (kms_element_request_srcpad (rtpendpointreceiver,
+          KMS_ELEMENT_PAD_TYPE_AUDIO));
+
+  data.injector = ssrc_start_injector (SSRC_RETURN_SSRC_A, data.recv_port);
+
+  step_id = g_timeout_add_seconds (SSRC_RETURN_STEP_SECONDS, ssrc_return_step,
+      &data);
+  id = g_timeout_add_seconds (30, print_timedout_pipeline, pipeline);
+
+  mark_point ();
+  g_main_loop_run (loop);
+  mark_point ();
+
+  fail_unless (data.first_ssrc_flowed,
+      "No audio from the first SSRC; the test never got started");
+  fail_unless (data.second_ssrc_flowed,
+      "Audio stopped when the SSRC changed");
+  fail_unless (data.first_ssrc_resumed,
+      "Audio did not come back when the original SSRC resumed: its receive "
+      "branch was parked and never attached again");
+
+  g_source_remove (step_id);
+  g_source_remove (id);
+
+  ssrc_stop_injector (&data.injector);
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+
+  gst_bus_remove_signal_watch (bus);
+  g_object_unref (bus);
+  g_object_unref (pipeline);
+  g_main_loop_unref (loop);
+  g_free (sender_sess_id);
+  g_free (receiver_sess_id);
+}
+
+GST_END_TEST
 
 GST_START_TEST (test_opus_sendonly_play_before_negotiation)
 {
@@ -641,6 +1050,8 @@ rtpendpoint_audio_test_suite (void)
   tcase_add_test (tc_chain, test_opus_sendonly_play_before_negotiation);
   tcase_add_test (tc_chain, test_opus_sendonly_play_after_negotiation);
   tcase_add_test (tc_chain, test_opus_sendrecv);
+  tcase_add_test (tc_chain, test_audio_ssrc_change);
+  tcase_add_test (tc_chain, test_audio_ssrc_return);
 
 #ifndef DISABLE_IPV6_TESTS
   tcase_add_test (tc_chain, test_opus_sendrecv_ipv6);

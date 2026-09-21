@@ -58,7 +58,7 @@ str_to_sdp (const std::string &sdpStr)
     throw KurentoException (SDP_PARSE_ERROR, "Error parsing SDP");
   }
 
-  if (gst_sdp_message_get_version(sdp) == nullptr) {
+  if (gst_sdp_message_get_version (sdp) == nullptr) {
     gst_sdp_message_free (sdp);
     throw KurentoException (SDP_PARSE_ERROR, "Invalid SDP");
   }
@@ -86,10 +86,11 @@ append_codec_to_array (GArray *array, const char *codec)
   g_value_init (&v, GST_TYPE_STRUCTURE);
 
   s = gst_structure_new_empty (codec);
+
   if (s == NULL) {
     std::string message =
-        std::string () + "Invalid codec name in config: '" + codec + "'";
-    GST_ERROR ("%s", message.c_str ());
+      std::string () + "Invalid codec name in config: '" + codec + "'";
+    GST_ERROR ("%s", message.c_str () );
     throw KurentoException (SDP_PARSE_ERROR, message);
   }
 
@@ -116,7 +117,7 @@ void SdpEndpointImpl::postConstructor ()
 
 SdpEndpointImpl::SdpEndpointImpl (const boost::property_tree::ptree &config,
                                   std::shared_ptr< MediaObjectImpl > parent,
-                                  const std::string &factoryName, bool useIpv6) :
+                                  const std::string &factoryName, bool useIpv6, bool listenDtmf) :
   SessionEndpointImpl (config, parent, factoryName)
 {
   GArray *audio_codecs, *video_codecs;
@@ -139,7 +140,7 @@ SdpEndpointImpl::SdpEndpointImpl (const boost::property_tree::ptree &config,
       (&acodec_list, PARAM_AUDIO_CODECS);
 
   for (std::shared_ptr<CodecConfiguration> conf : acodec_list) {
-    if (!conf->getName().empty()) {
+    if (!conf->getName().empty() ) {
       append_codec_to_array (audio_codecs, conf->getName().c_str() );
     }
   }
@@ -149,7 +150,7 @@ SdpEndpointImpl::SdpEndpointImpl (const boost::property_tree::ptree &config,
       (&vcodec_list, PARAM_VIDEO_CODECS);
 
   for (std::shared_ptr<CodecConfiguration> conf : vcodec_list) {
-    if (!conf->getName().empty()) {
+    if (!conf->getName().empty() ) {
       append_codec_to_array (video_codecs, conf->getName().c_str() );
     }
   }
@@ -159,6 +160,9 @@ SdpEndpointImpl::SdpEndpointImpl (const boost::property_tree::ptree &config,
   g_object_set (element, "num-video-medias", video_medias, "video-codecs",
                 video_codecs, NULL);
   g_object_set (element, "use-ipv6", useIpv6, NULL);
+  std::cout << "SdpEndpointImpl::SdpEndpointImpl listenDtmf: " << listenDtmf <<
+            std::endl;
+  g_object_set (element, "listen-dtmf", listenDtmf, NULL);
 
   offerInProcess = false;
   waitingAnswer = false;
@@ -199,13 +203,14 @@ std::string SdpEndpointImpl::generateOffer ()
 {
   std::shared_ptr<OfferOptions> options = std::make_shared <OfferOptions> ();
 
-  options->setOfferToReceiveAudio(true);
-  options->setOfferToReceiveVideo(true);
+  options->setOfferToReceiveAudio (true);
+  options->setOfferToReceiveVideo (true);
 
-  return generateOffer(options);
+  return generateOffer (options);
 }
 
-std::string SdpEndpointImpl::generateOffer (std::shared_ptr<OfferOptions> options)
+std::string SdpEndpointImpl::generateOffer (std::shared_ptr<OfferOptions>
+    options)
 {
   GstSDPMessage *offer = nullptr;
   std::string offerStr;
@@ -218,12 +223,12 @@ std::string SdpEndpointImpl::generateOffer (std::shared_ptr<OfferOptions> option
   }
 
   if (options->isSetOfferToReceiveAudio ()
-      && !options->getOfferToReceiveAudio ()) {
+      && !options->getOfferToReceiveAudio () ) {
     g_object_set (element, "num-audio-medias", 0, NULL);
   }
 
   if (options->isSetOfferToReceiveVideo ()
-      && !options->getOfferToReceiveVideo ()) {
+      && !options->getOfferToReceiveVideo () ) {
     g_object_set (element, "num-video-medias", 0, NULL);
   }
 
@@ -275,12 +280,12 @@ std::string SdpEndpointImpl::processOffer (const std::string &offer)
 
   try {
     MediaSessionStarted event (shared_from_this (),
-        MediaSessionStarted::getName ());
-    sigcSignalEmit(signalMediaSessionStarted, event);
+                               MediaSessionStarted::getName () );
+    sigcSignalEmit (signalMediaSessionStarted, event);
   } catch (const std::bad_weak_ptr &e) {
     // shared_from_this()
     GST_ERROR ("BUG creating %s: %s", MediaSessionStarted::getName ().c_str (),
-        e.what ());
+               e.what () );
   }
 
   return offerSdpStr;
@@ -323,12 +328,12 @@ std::string SdpEndpointImpl::processAnswer (const std::string &answer)
 
   try {
     MediaSessionStarted event (shared_from_this (),
-        MediaSessionStarted::getName());
-    sigcSignalEmit(signalMediaSessionStarted, event);
+                               MediaSessionStarted::getName() );
+    sigcSignalEmit (signalMediaSessionStarted, event);
   } catch (const std::bad_weak_ptr &e) {
     // shared_from_this()
     GST_ERROR ("BUG creating %s: %s", MediaSessionStarted::getName ().c_str (),
-        e.what ());
+               e.what () );
   }
 
   return getLocalSessionDescriptor ();

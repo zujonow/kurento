@@ -56,58 +56,71 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 #define PROP_MTU "mtu"
 
 /* Fixed point conversion macros */
-#define FRIC        65536.                  /* 2^16 as a double */
-#define FP2D(r)     ((double)(r) / FRIC)
+#define FRIC 65536. /* 2^16 as a double */
+#define FP2D(r) ((double)(r) / FRIC)
 
 namespace kurento
 {
-void BaseRtpEndpointImpl::postConstructor ()
+void
+BaseRtpEndpointImpl::postConstructor ()
 {
   SdpEndpointImpl::postConstructor ();
 
   mediaStateChangedHandlerId = register_signal_handler (G_OBJECT (element),
                                "media-state-changed",
-                               std::function <void (GstElement *, guint) > (std::bind (
-                                     &BaseRtpEndpointImpl::updateMediaState, this,
-                                     std::placeholders::_2) ),
-                               std::dynamic_pointer_cast<BaseRtpEndpointImpl>
-                               (shared_from_this() ) );
+                               std::function<void (GstElement *, guint) > (std::bind (
+                                     &BaseRtpEndpointImpl::updateMediaState, this, std::placeholders::_2) ),
+                               std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this () ) );
 
-  connStateChangedHandlerId = register_signal_handler (G_OBJECT (element),
-                              "connection-state-changed",
-                              std::function <void (GstElement *, gchar *, guint) > (std::bind (
-                                    &BaseRtpEndpointImpl::updateConnectionState, this,
-                                    std::placeholders::_2, std::placeholders::_3) ),
-                              std::dynamic_pointer_cast<BaseRtpEndpointImpl>
-                              (shared_from_this() ) );
+  connStateChangedHandlerId =
+    register_signal_handler (G_OBJECT (element), "connection-state-changed",
+                             std::function<void (GstElement *, gchar *, guint) > (
+                               std::bind (&BaseRtpEndpointImpl::updateConnectionState, this,
+                                          std::placeholders::_2, std::placeholders::_3) ),
+                             std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this () ) );
+
+  dtmfEventDetectedHandlerId = register_signal_handler (G_OBJECT (element),
+                               "dtmf-event-detected",
+                               std::function<void (GstElement *, gint, gboolean, gint, gint,
+                                   const gchar *) > (std::bind (&BaseRtpEndpointImpl::onDtmfEventDetected,
+                                       this, std::placeholders::_2, std::placeholders::_3,
+                                       std::placeholders::_4, std::placeholders::_5, std::placeholders::_6) ),
+                               std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this () ) );
 }
 
-BaseRtpEndpointImpl::BaseRtpEndpointImpl (const boost::property_tree::ptree
-    &config,
-    std::shared_ptr< MediaObjectImpl > parent,
-    const std::string &factoryName, bool useIpv6) :
-  SdpEndpointImpl (config, parent, factoryName, useIpv6)
+BaseRtpEndpointImpl::BaseRtpEndpointImpl (
+  const boost::property_tree::ptree &config,
+  std::shared_ptr<MediaObjectImpl> parent,
+  const std::string &factoryName,
+  bool useIpv6,
+  bool listenDtmf
+)
+  : SdpEndpointImpl (config, parent, factoryName, useIpv6, listenDtmf)
 {
-  current_media_state = std::make_shared <MediaState>
-                        (MediaState::DISCONNECTED);
+  current_media_state = std::make_shared<MediaState> (MediaState::DISCONNECTED);
   mediaStateChangedHandlerId = 0;
 
-  current_conn_state = std::make_shared <ConnectionState>
-                       (ConnectionState::DISCONNECTED);
+  current_conn_state =
+    std::make_shared<ConnectionState> (ConnectionState::DISCONNECTED);
   connStateChangedHandlerId = 0;
 
+  dtmfEventDetectedHandlerId = 0;
+
   guint minPort = 0;
-  if (getConfigValue<guint, BaseRtpEndpoint> (&minPort, PARAM_MIN_PORT)) {
+
+  if (getConfigValue<guint, BaseRtpEndpoint> (&minPort, PARAM_MIN_PORT) ) {
     g_object_set (getGstreamerElement (), PROP_MIN_PORT, minPort, NULL);
   }
 
   guint maxPort = 0;
-  if (getConfigValue <guint, BaseRtpEndpoint> (&maxPort, PARAM_MAX_PORT)) {
+
+  if (getConfigValue<guint, BaseRtpEndpoint> (&maxPort, PARAM_MAX_PORT) ) {
     g_object_set (getGstreamerElement (), PROP_MAX_PORT, maxPort, NULL);
   }
 
   guint mtu;
-  if (getConfigValue <guint, BaseRtpEndpoint> (&mtu, PARAM_MTU)) {
+
+  if (getConfigValue<guint, BaseRtpEndpoint> (&mtu, PARAM_MTU) ) {
     GST_INFO ("Predefined RTP MTU: %u", mtu);
     g_object_set (G_OBJECT (element), PROP_MTU, mtu, NULL);
   } else {
@@ -124,6 +137,10 @@ BaseRtpEndpointImpl::~BaseRtpEndpointImpl ()
   if (connStateChangedHandlerId > 0) {
     unregister_signal_handler (element, connStateChangedHandlerId);
   }
+
+  if (dtmfEventDetectedHandlerId > 0) {
+    unregister_signal_handler (element, dtmfEventDetectedHandlerId);
+  }
 }
 
 void
@@ -135,7 +152,7 @@ BaseRtpEndpointImpl::requestKeyframe ()
 
   if (!ret) {
     throw KurentoException (MEDIA_OBJECT_OPERATION_NOT_SUPPORTED,
-        "Keyframe request failed (must be requested from a subscriber element)");
+                            "Keyframe request failed (must be requested from a subscriber element)");
   }
 }
 
@@ -147,13 +164,12 @@ BaseRtpEndpointImpl::updateMediaState (guint new_state)
 
   switch (new_state) {
   case KMS_MEDIA_DISCONNECTED:
-    current_media_state = std::make_shared <MediaState>
-                          (MediaState::DISCONNECTED);
+    current_media_state =
+      std::make_shared<MediaState> (MediaState::DISCONNECTED);
     break;
 
   case KMS_MEDIA_CONNECTED:
-    current_media_state = std::make_shared <MediaState>
-                          (MediaState::CONNECTED);
+    current_media_state = std::make_shared<MediaState> (MediaState::CONNECTED);
     break;
 
   default:
@@ -161,17 +177,18 @@ BaseRtpEndpointImpl::updateMediaState (guint new_state)
     return;
   }
 
-  if (old_state->getValue() != current_media_state->getValue() ) {
+  if (old_state->getValue () != current_media_state->getValue () ) {
     GST_DEBUG_OBJECT (element, "MediaState changed to '%s'",
-        current_media_state->getString().c_str());
+                      current_media_state->getString ().c_str () );
+
     try {
       MediaStateChanged event (shared_from_this (),
-          MediaStateChanged::getName (), old_state, current_media_state);
-      sigcSignalEmit(signalMediaStateChanged, event);
+                               MediaStateChanged::getName (), old_state, current_media_state);
+      sigcSignalEmit (signalMediaStateChanged, event);
     } catch (const std::bad_weak_ptr &e) {
       // shared_from_this()
       GST_ERROR ("BUG creating %s: %s", MediaStateChanged::getName ().c_str (),
-          e.what ());
+                 e.what () );
     }
   }
 }
@@ -184,13 +201,13 @@ BaseRtpEndpointImpl::updateConnectionState (gchar *sessId, guint new_state)
 
   switch (new_state) {
   case KMS_CONNECTION_DISCONNECTED:
-    current_conn_state = std::make_shared <ConnectionState>
-                         (ConnectionState::DISCONNECTED);
+    current_conn_state =
+      std::make_shared<ConnectionState> (ConnectionState::DISCONNECTED);
     break;
 
   case KMS_CONNECTION_CONNECTED:
-    current_conn_state = std::make_shared <ConnectionState>
-                         (ConnectionState::CONNECTED);
+    current_conn_state =
+      std::make_shared<ConnectionState> (ConnectionState::CONNECTED);
     break;
 
   default:
@@ -198,22 +215,50 @@ BaseRtpEndpointImpl::updateConnectionState (gchar *sessId, guint new_state)
     return;
   }
 
-  if (old_state->getValue() != current_conn_state->getValue() ) {
+  if (old_state->getValue () != current_conn_state->getValue () ) {
     GST_DEBUG_OBJECT (element, "ConnectionState changed to '%s'",
-        current_conn_state->getString().c_str());
+                      current_conn_state->getString ().c_str () );
+
     try {
-      ConnectionStateChanged event (shared_from_this(),
-          ConnectionStateChanged::getName (), old_state, current_conn_state);
-      sigcSignalEmit(signalConnectionStateChanged, event);
+      ConnectionStateChanged event (shared_from_this (),
+                                    ConnectionStateChanged::getName (), old_state, current_conn_state);
+      sigcSignalEmit (signalConnectionStateChanged, event);
     } catch (const std::bad_weak_ptr &e) {
       // shared_from_this()
       GST_ERROR ("BUG creating %s: %s",
-          ConnectionStateChanged::getName ().c_str (), e.what ());
+                 ConnectionStateChanged::getName ().c_str (), e.what () );
     }
   }
 }
 
-int BaseRtpEndpointImpl::getMinVideoRecvBandwidth ()
+void
+BaseRtpEndpointImpl::onDtmfEventDetected (gint number,
+    gboolean end,
+    gint volume,
+    gint duration,
+    const gchar *mediaType)
+{
+  // Example logic — you can add your actual processing or logging here
+  std::cout << "DTMF Detected:"
+            << " Number: " << number << ", End: " << end
+            << ", Volume: " << volume << ", Duration: " << duration
+            << ", MediaType: " << mediaType << std::endl;
+
+  try {
+    DtmfEventDetected event (shared_from_this (), DtmfEventDetected::getName (),
+                             number, end, volume, duration, mediaType);
+    sigcSignalEmit (signalDtmfEventDetected, event);
+  } catch (const std::bad_weak_ptr &e) {
+    // shared_from_this()
+    GST_ERROR ("BUG creating %s: %s", DtmfEventDetected::getName ().c_str (),
+               e.what () );
+  }
+
+  // You might also want to emit a signal to JS or invoke internal handlers
+}
+
+int
+BaseRtpEndpointImpl::getMinVideoRecvBandwidth ()
 {
   int minVideoRecvBandwidth;
 
@@ -223,12 +268,15 @@ int BaseRtpEndpointImpl::getMinVideoRecvBandwidth ()
   return minVideoRecvBandwidth;
 }
 
-void BaseRtpEndpointImpl::setMinVideoRecvBandwidth (int minVideoRecvBandwidth)
+void
+BaseRtpEndpointImpl::setMinVideoRecvBandwidth (int minVideoRecvBandwidth)
 {
-  g_object_set (element, "min-video-recv-bandwidth", minVideoRecvBandwidth, NULL);
+  g_object_set (element, "min-video-recv-bandwidth", minVideoRecvBandwidth,
+                NULL);
 }
 
-int BaseRtpEndpointImpl::getMinVideoSendBandwidth ()
+int
+BaseRtpEndpointImpl::getMinVideoSendBandwidth ()
 {
   int minVideoSendBandwidth;
 
@@ -238,12 +286,15 @@ int BaseRtpEndpointImpl::getMinVideoSendBandwidth ()
   return minVideoSendBandwidth;
 }
 
-void BaseRtpEndpointImpl::setMinVideoSendBandwidth (int minVideoSendBandwidth)
+void
+BaseRtpEndpointImpl::setMinVideoSendBandwidth (int minVideoSendBandwidth)
 {
-  g_object_set (element, "min-video-send-bandwidth", minVideoSendBandwidth, NULL);
+  g_object_set (element, "min-video-send-bandwidth", minVideoSendBandwidth,
+                NULL);
 }
 
-int BaseRtpEndpointImpl::getMaxVideoSendBandwidth ()
+int
+BaseRtpEndpointImpl::getMaxVideoSendBandwidth ()
 {
   int maxVideoSendBandwidth;
 
@@ -253,9 +304,11 @@ int BaseRtpEndpointImpl::getMaxVideoSendBandwidth ()
   return maxVideoSendBandwidth;
 }
 
-void BaseRtpEndpointImpl::setMaxVideoSendBandwidth (int maxVideoSendBandwidth)
+void
+BaseRtpEndpointImpl::setMaxVideoSendBandwidth (int maxVideoSendBandwidth)
 {
-  g_object_set (element, "max-video-send-bandwidth", maxVideoSendBandwidth, NULL);
+  g_object_set (element, "max-video-send-bandwidth", maxVideoSendBandwidth,
+                NULL);
 }
 
 std::shared_ptr<MediaState>
@@ -273,7 +326,7 @@ BaseRtpEndpointImpl::getConnectionState ()
 std::shared_ptr<RembParams>
 BaseRtpEndpointImpl::getRembParams ()
 {
-  std::shared_ptr<RembParams> ret (new RembParams() );
+  std::shared_ptr<RembParams> ret (new RembParams () );
   GstStructure *params;
   gint auxi;
   gfloat auxf;
@@ -326,51 +379,51 @@ BaseRtpEndpointImpl::setRembParams (std::shared_ptr<RembParams> rembParams)
   /* REMB local begin */
   if (rembParams->isSetPacketsRecvIntervalTop () ) {
     gst_structure_set (params, "packets-recv-interval-top", G_TYPE_INT,
-                       rembParams->getPacketsRecvIntervalTop(), NULL);
+                       rembParams->getPacketsRecvIntervalTop (), NULL);
     GST_DEBUG_OBJECT (element, "New 'packetsRecvIntervalTop' value: %d",
-                      rembParams->getPacketsRecvIntervalTop() );
+                      rembParams->getPacketsRecvIntervalTop () );
   }
 
   if (rembParams->isSetExponentialFactor () ) {
     gst_structure_set (params, "exponential-factor", G_TYPE_FLOAT,
-                       rembParams->getExponentialFactor(), NULL);
+                       rembParams->getExponentialFactor (), NULL);
     GST_DEBUG_OBJECT (element, "New 'exponentialFactor' value: %g",
-                      rembParams->getExponentialFactor() );
+                      rembParams->getExponentialFactor () );
   }
 
   if (rembParams->isSetLinealFactorMin () ) {
     gst_structure_set (params, "lineal-factor-min", G_TYPE_INT,
-                       rembParams->getLinealFactorMin(), NULL);
+                       rembParams->getLinealFactorMin (), NULL);
     GST_DEBUG_OBJECT (element, "New 'linealFactorMin' value: %d",
-                      rembParams->getLinealFactorMin() );
+                      rembParams->getLinealFactorMin () );
   }
 
   if (rembParams->isSetLinealFactorGrade () ) {
     gst_structure_set (params, "lineal-factor-grade", G_TYPE_FLOAT,
-                       rembParams->getLinealFactorGrade(), NULL);
+                       rembParams->getLinealFactorGrade (), NULL);
     GST_DEBUG_OBJECT (element, "New 'linealFactorGrade' value: %g",
-                      rembParams->getLinealFactorGrade() );
+                      rembParams->getLinealFactorGrade () );
   }
 
   if (rembParams->isSetDecrementFactor () ) {
     gst_structure_set (params, "decrement-factor", G_TYPE_FLOAT,
-                       rembParams->getDecrementFactor(), NULL);
+                       rembParams->getDecrementFactor (), NULL);
     GST_DEBUG_OBJECT (element, "New 'decrementFactor' value: %g",
-                      rembParams->getDecrementFactor() );
+                      rembParams->getDecrementFactor () );
   }
 
   if (rembParams->isSetThresholdFactor () ) {
     gst_structure_set (params, "threshold-factor", G_TYPE_FLOAT,
-                       rembParams->getThresholdFactor(), NULL);
+                       rembParams->getThresholdFactor (), NULL);
     GST_DEBUG_OBJECT (element, "New 'thresholdFactor' value: %g",
-                      rembParams->getThresholdFactor() );
+                      rembParams->getThresholdFactor () );
   }
 
   if (rembParams->isSetUpLosses () ) {
     gst_structure_set (params, "up-losses", G_TYPE_INT,
-                       rembParams->getUpLosses(), NULL);
+                       rembParams->getUpLosses (), NULL);
     GST_DEBUG_OBJECT (element, "New 'upLosses' value: %d",
-                      rembParams->getUpLosses() );
+                      rembParams->getUpLosses () );
   }
 
   /* REMB local end */
@@ -378,9 +431,9 @@ BaseRtpEndpointImpl::setRembParams (std::shared_ptr<RembParams> rembParams)
   /* REMB remote begin */
   if (rembParams->isSetRembOnConnect () ) {
     gst_structure_set (params, "remb-on-connect", G_TYPE_INT,
-                       rembParams->getRembOnConnect(), NULL);
+                       rembParams->getRembOnConnect (), NULL);
     GST_DEBUG_OBJECT (element, "New 'rembOnConnect' value: %d",
-                      rembParams->getRembOnConnect() );
+                      rembParams->getRembOnConnect () );
   }
 
   /* REMB remote end */
@@ -411,28 +464,25 @@ BaseRtpEndpointImpl::setMtu (int mtu)
 /******************/
 static std::shared_ptr<RTCInboundRTPStreamStats>
 createRTCInboundRTPStreamStats (const GstStructure *source_stats,
-    gchar *id,
-    gchar *ssrc,
-    guint nackCount)
+                                gchar *id,
+                                gchar *ssrc,
+                                guint nackCount)
 {
   guint64 bytesReceived, packetsReceived;
   guint jitter, fractionLost, pliCount, firCount, remb;
   gint packetLost, clock_rate;
   float jitterSec;
 
-  packetLost = jitter = fractionLost = pliCount = firCount = remb =
-                                         clock_rate = 0;
+  packetLost = jitter = fractionLost = pliCount = firCount = remb = clock_rate =
+                                         0;
   bytesReceived = packetsReceived = G_GUINT64_CONSTANT (0);
   jitterSec = 0.0;
 
-  gst_structure_get (source_stats,
-                     "packets-received", G_TYPE_UINT64, &packetsReceived,
-                     "octets-received", G_TYPE_UINT64, &bytesReceived,
-                     "sent-rb-packetslost", G_TYPE_INT, &packetLost,
-                     "sent-rb-fractionlost", G_TYPE_UINT, &fractionLost,
-                     "clock-rate", G_TYPE_INT, &clock_rate,
-                     "jitter", G_TYPE_UINT, &jitter,
-                     NULL);
+  gst_structure_get (source_stats, "packets-received", G_TYPE_UINT64,
+                     &packetsReceived, "octets-received", G_TYPE_UINT64, &bytesReceived,
+                     "sent-rb-packetslost", G_TYPE_INT, &packetLost, "sent-rb-fractionlost",
+                     G_TYPE_UINT, &fractionLost, "clock-rate", G_TYPE_INT, &clock_rate,
+                     "jitter", G_TYPE_UINT, &jitter, NULL);
 
   /* jitter is computed in timestamp units. Convert it to seconds */
   if (clock_rate > 0) {
@@ -441,9 +491,10 @@ createRTCInboundRTPStreamStats (const GstStructure *source_stats,
 
   /* Next fields are only available with PLI and FIR statistics patches so */
   /* hey are prone to fail if these patches are not applied in Gstreamer */
-  if (!gst_structure_get (source_stats, "sent-pli-count", G_TYPE_UINT, &pliCount,
-                          "sent-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
-    GST_WARNING ("Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
+  if (!gst_structure_get (source_stats, "sent-pli-count", G_TYPE_UINT,
+                          &pliCount, "sent-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
+    GST_WARNING (
+      "Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
   }
 
   if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL) ) {
@@ -451,16 +502,16 @@ createRTCInboundRTPStreamStats (const GstStructure *source_stats,
   }
 
   return std::make_shared<RTCInboundRTPStreamStats> (id,
-      std::make_shared<StatsType> (StatsType::inboundrtp), 0, ssrc, "",
-      false, "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
-      (float)fractionLost, packetsReceived, bytesReceived, jitterSec);
+         std::make_shared<StatsType> (StatsType::inboundrtp), 0, ssrc, "", false,
+         "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
+         (float) fractionLost, packetsReceived, bytesReceived, jitterSec);
 }
 
 static std::shared_ptr<RTCOutboundRTPStreamStats>
 createRTCOutboundRTPStreamStats (const GstStructure *source_stats,
-    gchar *id,
-    gchar *ssrc,
-    guint nackCount)
+                                 gchar *id,
+                                 gchar *ssrc,
+                                 guint nackCount)
 {
   guint64 bytesSent, packetsSent, bitRate;
   guint pliCount, firCount, remb, rtt, fractionLost;
@@ -470,23 +521,21 @@ createRTCOutboundRTPStreamStats (const GstStructure *source_stats,
   bytesSent = packetsSent = bitRate = G_GUINT64_CONSTANT (0);
   pliCount = firCount = remb = rtt = 0;
 
-  gst_structure_get (source_stats,
-                     "packets-sent", G_TYPE_UINT64, &packetsSent,
-                     "octets-sent", G_TYPE_UINT64, &bytesSent,
-                     "bitrate", G_TYPE_UINT64, &bitRate,
-                     "round-trip-time", G_TYPE_UINT, &rtt,
-                     "outbound-fraction-lost", G_TYPE_UINT, &fractionLost,
-                     "outbound-packet-lost", G_TYPE_INT, &packetLost,
-                     NULL);
+  gst_structure_get (source_stats, "packets-sent", G_TYPE_UINT64, &packetsSent,
+                     "octets-sent", G_TYPE_UINT64, &bytesSent, "bitrate", G_TYPE_UINT64,
+                     &bitRate, "round-trip-time", G_TYPE_UINT, &rtt, "outbound-fraction-lost",
+                     G_TYPE_UINT, &fractionLost, "outbound-packet-lost", G_TYPE_INT,
+                     &packetLost, NULL);
 
   /* the round-trip time (in NTP Short Format, 16.16 fixed point) */
   roundTripTime = FP2D (rtt);
 
   /* Next fields are only available with PLI and FIR statistics patches so */
   /* hey are prone to fail if these patches are not applied in Gstreamer */
-  if (!gst_structure_get (source_stats, "recv-pli-count", G_TYPE_UINT, &pliCount,
-                          "recv-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
-    GST_WARNING ("Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
+  if (!gst_structure_get (source_stats, "recv-pli-count", G_TYPE_UINT,
+                          &pliCount, "recv-fir-count", G_TYPE_UINT, &firCount, NULL) ) {
+    GST_WARNING (
+      "Current version of gstreamer has neither PLI nor FIR statistics patches applied.");
   }
 
   if (!gst_structure_get (source_stats, "remb", G_TYPE_UINT, &remb, NULL) ) {
@@ -494,14 +543,15 @@ createRTCOutboundRTPStreamStats (const GstStructure *source_stats,
   }
 
   return std::make_shared<RTCOutboundRTPStreamStats> (id,
-      std::make_shared<StatsType> (StatsType::outboundrtp), 0, ssrc, "",
-      false, "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
-      (float)fractionLost, packetsSent, bytesSent, (float)bitRate,
-      roundTripTime);
+         std::make_shared<StatsType> (StatsType::outboundrtp), 0, ssrc, "", false,
+         "", "", "", firCount, pliCount, nackCount, 0, remb, packetLost,
+         (float) fractionLost, packetsSent, bytesSent, (float) bitRate,
+         roundTripTime);
 }
 
 static std::shared_ptr<RTCRTPStreamStats>
-createRTCRTPStreamStats (guint nackSent, guint nackRecv,
+createRTCRTPStreamStats (guint nackSent,
+                         guint nackRecv,
                          const GstStructure *source_stats)
 {
   std::shared_ptr<RTCRTPStreamStats> rtcStats;
@@ -517,11 +567,11 @@ createRTCRTPStreamStats (guint nackSent, guint nackRecv,
   if (internal) {
     /* Local SSRC */
     rtcStats =
-        createRTCOutboundRTPStreamStats (source_stats, id, ssrc_str, nackRecv);
+      createRTCOutboundRTPStreamStats (source_stats, id, ssrc_str, nackRecv);
   } else {
     /* Remote SSRC */
     rtcStats =
-        createRTCInboundRTPStreamStats (source_stats, id, ssrc_str, nackSent);
+      createRTCInboundRTPStreamStats (source_stats, id, ssrc_str, nackSent);
   }
 
   g_free (ssrc_str);
@@ -531,9 +581,10 @@ createRTCRTPStreamStats (guint nackSent, guint nackRecv,
 }
 
 static void
-collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
-                          &statsReport, int64_t timestampMillis,
-                          const GstStructure *session_stats)
+collectRTCRTPStreamStats (
+  std::map<std::string, std::shared_ptr<Stats>> &statsReport,
+  int64_t timestampMillis,
+  const GstStructure *session_stats)
 {
   guint nackSent, nackRecv;
   gint i, n;
@@ -579,8 +630,8 @@ collectRTCRTPStreamStats (std::map <std::string, std::shared_ptr<Stats>>
 }
 
 static void
-collectRTCStats (std::map <std::string, std::shared_ptr<Stats>>
-                 &statsReport, int64_t timestampMillis,
+collectRTCStats (std::map<std::string, std::shared_ptr<Stats>> &statsReport,
+                 int64_t timestampMillis,
                  const GstStructure *rtc_stats)
 {
   gint i, n;
@@ -617,10 +668,11 @@ collectRTCStats (std::map <std::string, std::shared_ptr<Stats>>
 }
 
 void
-BaseRtpEndpointImpl::collectEndpointStats (std::map
-    <std::string, std::shared_ptr<Stats>>
-    &statsReport, std::string id, const GstStructure *e_stats,
-    int64_t timestampMillis)
+BaseRtpEndpointImpl::collectEndpointStats (
+  std::map<std::string, std::shared_ptr<Stats>> &statsReport,
+  std::string id,
+  const GstStructure *e_stats,
+  int64_t timestampMillis)
 {
   std::shared_ptr<Stats> endpointStats;
   GstStructure *e2e_stats;
@@ -634,18 +686,18 @@ BaseRtpEndpointImpl::collectEndpointStats (std::map
     gst_structure_free (e2e_stats);
   }
 
-  endpointStats = std::make_shared <EndpointStats> (id,
-                  std::make_shared <StatsType> (StatsType::endpoint),
-                  timestampMillis, inputStats, e2eStats);
+  endpointStats = std::make_shared<EndpointStats> (id,
+                  std::make_shared<StatsType> (StatsType::endpoint), timestampMillis,
+                  inputStats, e2eStats);
 
   statsReport[id] = endpointStats;
 }
 
 void
-BaseRtpEndpointImpl::fillStatsReport (std::map
-                                      <std::string, std::shared_ptr<Stats>>
-                                      &report, const GstStructure *stats,
-                                      int64_t timestampMillis)
+BaseRtpEndpointImpl::fillStatsReport (
+  std::map<std::string, std::shared_ptr<Stats>> &report,
+  const GstStructure *stats,
+  int64_t timestampMillis)
 {
   const GstStructure *e_stats, *rtc_stats;
 
@@ -658,7 +710,7 @@ BaseRtpEndpointImpl::fillStatsReport (std::map
   rtc_stats = kms_utils_get_structure_by_name (stats, KMS_RTC_STATISTICS_FIELD);
 
   if (rtc_stats != nullptr) {
-    collectRTCStats (report, timestampMillis, rtc_stats );
+    collectRTCStats (report, timestampMillis, rtc_stats);
   }
 
   SdpEndpointImpl::fillStatsReport (report, stats, timestampMillis);
@@ -666,10 +718,10 @@ BaseRtpEndpointImpl::fillStatsReport (std::map
 
 BaseRtpEndpointImpl::StaticConstructor BaseRtpEndpointImpl::staticConstructor;
 
-BaseRtpEndpointImpl::StaticConstructor::StaticConstructor()
+BaseRtpEndpointImpl::StaticConstructor::StaticConstructor ()
 {
   GST_DEBUG_CATEGORY_INIT (GST_CAT_DEFAULT, GST_DEFAULT_NAME, 0,
                            GST_DEFAULT_NAME);
 }
 
-} /* kurento */
+} // namespace kurento
