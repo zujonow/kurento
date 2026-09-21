@@ -80,7 +80,17 @@ function trap_add {
     local NAME="$2"
     local TRAP;
     # Append the new command to the already existing trap command, if any.
-    TRAP="$(trap -p "$NAME" | { grep -o "'.*'" || true; } | tr -d "'"); $COMMAND"
+    TRAP="$(trap -p "$NAME" | { grep -o "'.*'" || true; } | tr -d "'")"
+    # With no handler installed for this signal, appending would leave a body
+    # starting with ';'. That is a syntax error, and Bash only reports it when
+    # the trap fires -- so the script dies at the very end, after its real work
+    # has already succeeded, with "exit trap: line 1: syntax error near
+    # unexpected token ';'" and exit code 2.
+    if [[ -n "$TRAP" ]]; then
+        TRAP="$TRAP; $COMMAND"
+    else
+        TRAP="$COMMAND"
+    fi
     # shellcheck disable=SC2064
     trap "$TRAP" "$NAME"
 }
