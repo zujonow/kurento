@@ -72,7 +72,7 @@ done
 if [ -n "$MISSING_ARCH" ]; then
     echo ""
     echo "Error: Missing packages for architectures:$MISSING_ARCH"
-    echo "Please run: ./build_all_docker.sh"
+    echo "Please run: ./build_and_create_image.sh"
     exit 1
 fi
 
