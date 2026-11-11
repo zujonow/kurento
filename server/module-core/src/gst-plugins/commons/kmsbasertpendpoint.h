@@ -78,6 +78,10 @@ struct _KmsBaseRtpEndpointClass {
       gint volume,
       gint duration,
       const gchar *media_type);
+
+  void (*keyframe_needed) (KmsBaseRtpEndpoint *self,
+      guint ssrc,
+      const gchar *reason);
 };
 
 GType kms_base_rtp_endpoint_get_type (void);

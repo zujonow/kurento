@@ -87,6 +87,41 @@ G_DEFINE_TYPE_WITH_CODE (KmsBaseRtpEndpoint, kms_base_rtp_endpoint,
  * that a genuine resume is not audible as a gap. */
 #define BRANCH_TAKEOVER_SILENCE_AUDIO_MS 300  /* JB_READY_AUDIO_LATENCY is 100 */
 #define BRANCH_TAKEOVER_SILENCE_VIDEO_MS 700  /* JB_READY_VIDEO_LATENCY is 500 */
+
+/* Keyframe handling for the received video ("keyframe-mode").
+ *
+ * Every keyframe request bound for the remote sender -- packet loss turned into
+ * GAP/DISCONT by the jitterbuffer, drop-until-keyframe, a PLI from a consumer
+ * downstream -- reaches the video depayloader's sink pad as an upstream
+ * GstForceKeyUnit event, and rtpbin turns it into RTCP PLI/FIR only if rtcp-fb
+ * was negotiated. Senders that negotiate none, or ignore it (typical of SIP
+ * video endpoints), leave the picture frozen until their next keyframe.
+ *
+ *   RTCP  (default) today's behaviour: RTCP only, nothing else is done.
+ *   SMART           emit "keyframe-needed" when RTCP cannot work (no rtcp-fb)
+ *                   or has proven not to (KEYFRAME_RTCP_MAX_MISSES requests in a
+ *                   row with no keyframe within KEYFRAME_RTCP_TIMEOUT_US); in
+ *                   the latter case RTCP requests to that SSRC stop for good.
+ *   BOTH            emit "keyframe-needed" for every request, and let RTCP go
+ *                   out as well.
+ *
+ * The application answers the signal through its own signalling (e.g. SIP INFO
+ * picture_fast_update). Order matches the KeyFrameMode enum of the API. */
+typedef enum
+{
+  KMS_KEYFRAME_MODE_RTCP = 0,
+  KMS_KEYFRAME_MODE_SMART = 1,
+  KMS_KEYFRAME_MODE_BOTH = 2,
+} KmsKeyframeMode;
+
+#define DEFAULT_KEYFRAME_MODE KMS_KEYFRAME_MODE_RTCP
+#define KEYFRAME_NEEDED_MIN_INTERVAL_US (G_USEC_PER_SEC)
+#define KEYFRAME_RTCP_TIMEOUT_US (2 * G_USEC_PER_SEC)
+#define KEYFRAME_RTCP_MAX_MISSES 2
+
+#define KEYFRAME_REASON_NO_RTCP_FB "NO_RTCP_FB"
+#define KEYFRAME_REASON_RTCP_UNRESPONSIVE "RTCP_UNRESPONSIVE"
+#define KEYFRAME_REASON_BOTH "BOTH"
 #define RTCP_FB_CCM_FIR   SDP_MEDIA_RTCP_FB_CCM " " SDP_MEDIA_RTCP_FB_FIR
 #define RTCP_FB_NACK_PLI  SDP_MEDIA_RTCP_FB_NACK " " SDP_MEDIA_RTCP_FB_PLI
 
@@ -404,6 +439,15 @@ struct _KmsBaseRtpEndpointPrivate
   /* Timestamps */
   gssize init_stats;
   FILE *stats_file;
+
+  /* "keyframe-mode"; a KmsKeyframeMode, atomic. Read when a video branch is
+   * attached, so a change applies from the next SSRC on. */
+  gint keyframe_mode;
+
+  /* Throttles "keyframe-needed". Its own lock because it is taken from
+   * streaming threads, where KMS_ELEMENT_LOCK must not be. */
+  GMutex keyframe_mutex;
+  gint64 last_keyframe_needed_us;
 };
 
 /* Signals and args */
@@ -416,6 +460,7 @@ enum
   CONNECTION_STATE_CHANGED,
   SIGNAL_REQUEST_LOCAL_KEY_FRAME,
   DTMF_EVENT_DETECTED,
+  KEYFRAME_NEEDED,
   LAST_SIGNAL
 };
 
@@ -446,6 +491,7 @@ enum
   PROP_SUPPORT_FEC,
   PROP_OFFER_DIR,
   PROP_MTU,
+  PROP_KEYFRAME_MODE,
   PROP_LAST
 };
 
@@ -2598,6 +2644,263 @@ kms_base_rtp_endpoint_branch_fallback_to_fakesink (KmsBaseRtpEndpoint *self,
   }
 }
 
+/* Keyframe monitor begin */
+
+/* Per attached video depayloader; see the comment on KmsKeyframeMode. A new
+ * one is built on every attach, so an SSRC change or revival starts afresh and
+ * an RTCP-unresponsive verdict never carries over to a different sender.
+ *
+ * Refcounted: each probe holds a reference and drops it from its destroy
+ * notify, which runs when the probe is removed or the depayloader's pads go
+ * away. Nothing here points at the KmsRecvBranch, which pad-removed may free
+ * while a probe is still around. */
+typedef struct _KmsKeyframeMonitor
+{
+  /* Not reffed, as for KmsRecvBranch::endpoint: the depayloader carrying the
+   * probes is a child of the endpoint and cannot outlive it. */
+  KmsBaseRtpEndpoint *endpoint;
+  guint ssrc;
+  KmsKeyframeMode mode;
+  gboolean rtcp_fb;             /* PLI or FIR negotiated for this payload */
+
+  /* SMART + rtcp_fb only; guarded by mutex */
+  GMutex mutex;
+  gint64 pending_since_us;      /* RTCP request outstanding since; 0 if none */
+  guint misses;                 /* consecutive requests left unanswered */
+  gboolean unresponsive;        /* latched: RTCP no longer used for this SSRC */
+} KmsKeyframeMonitor;
+
+static void
+kms_keyframe_monitor_clear (KmsKeyframeMonitor *monitor)
+{
+  g_mutex_clear (&monitor->mutex);
+}
+
+static KmsKeyframeMonitor *
+kms_keyframe_monitor_new (KmsBaseRtpEndpoint *endpoint, guint ssrc,
+    KmsKeyframeMode mode, gboolean rtcp_fb)
+{
+  KmsKeyframeMonitor *monitor = g_atomic_rc_box_new0 (KmsKeyframeMonitor);
+
+  monitor->endpoint = endpoint;
+  monitor->ssrc = ssrc;
+  monitor->mode = mode;
+  monitor->rtcp_fb = rtcp_fb;
+  g_mutex_init (&monitor->mutex);
+
+  return monitor;
+}
+
+static KmsKeyframeMonitor *
+kms_keyframe_monitor_ref (KmsKeyframeMonitor *monitor)
+{
+  return g_atomic_rc_box_acquire (monitor);
+}
+
+static void
+kms_keyframe_monitor_unref (gpointer monitor)
+{
+  g_atomic_rc_box_release_full (monitor,
+      (GDestroyNotify) kms_keyframe_monitor_clear);
+}
+
+/* Called on streaming threads: takes no lock but its own. */
+static void
+kms_base_rtp_endpoint_emit_keyframe_needed (KmsBaseRtpEndpoint *self,
+    guint ssrc, const gchar *reason)
+{
+  gint64 now = g_get_monotonic_time ();
+  gboolean emit = FALSE;
+
+  g_mutex_lock (&self->priv->keyframe_mutex);
+  if (self->priv->last_keyframe_needed_us == 0
+      || now - self->priv->last_keyframe_needed_us >=
+      KEYFRAME_NEEDED_MIN_INTERVAL_US) {
+    self->priv->last_keyframe_needed_us = now;
+    emit = TRUE;
+  }
+  g_mutex_unlock (&self->priv->keyframe_mutex);
+
+  if (!emit) {
+    GST_TRACE_OBJECT (self, "Keyframe needed (SSRC %u, %s): throttled", ssrc,
+        reason);
+    return;
+  }
+
+  GST_DEBUG_OBJECT (self, "Keyframe needed from SSRC %u: %s", ssrc, reason);
+  g_signal_emit (G_OBJECT (self), obj_signals[KEYFRAME_NEEDED], 0, ssrc,
+      reason);
+}
+
+/* Upstream events leaving the depayloader towards rtpbin. Decides, for every
+ * keyframe request, whether the application is told and whether RTCP still
+ * gets to carry it. */
+static GstPadProbeReturn
+kms_keyframe_monitor_request_probe (GstPad *pad, GstPadProbeInfo *info,
+    gpointer user_data)
+{
+  KmsKeyframeMonitor *monitor = user_data;
+  GstEvent *event = gst_pad_probe_info_get_event (info);
+  const gchar *reason = NULL;
+  gboolean drop = FALSE;
+
+  if (event == NULL || !gst_video_event_is_force_key_unit (event)) {
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (monitor->mode == KMS_KEYFRAME_MODE_BOTH) {
+    reason = KEYFRAME_REASON_BOTH;
+  } else if (!monitor->rtcp_fb) {
+    /* rtpbin would discard it anyway; nothing to drop */
+    reason = KEYFRAME_REASON_NO_RTCP_FB;
+  } else {
+    g_mutex_lock (&monitor->mutex);
+    if (monitor->unresponsive) {
+      reason = KEYFRAME_REASON_RTCP_UNRESPONSIVE;
+      drop = TRUE;
+    } else if (monitor->pending_since_us == 0) {
+      monitor->pending_since_us = g_get_monotonic_time ();
+    }
+    g_mutex_unlock (&monitor->mutex);
+  }
+
+  if (reason != NULL) {
+    kms_base_rtp_endpoint_emit_keyframe_needed (monitor->endpoint,
+        monitor->ssrc, reason);
+  }
+
+  /* A dropped upstream event reports success to whoever sent it */
+  return drop ? GST_PAD_PROBE_DROP : GST_PAD_PROBE_OK;
+}
+
+static gboolean
+kms_keyframe_monitor_find_keyframe (GstBuffer **buffer, guint idx,
+    gpointer user_data)
+{
+  if (!GST_BUFFER_FLAG_IS_SET (*buffer, GST_BUFFER_FLAG_DELTA_UNIT)) {
+    *(gboolean *) user_data = TRUE;
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/* Depayloader output, SMART with rtcp-fb only: judges whether the RTCP
+ * requests are being answered. No timer is needed, because a stream that lost
+ * packets keeps delivering delta frames while it waits for its keyframe. */
+static GstPadProbeReturn
+kms_keyframe_monitor_buffer_probe (GstPad *pad, GstPadProbeInfo *info,
+    gpointer user_data)
+{
+  KmsKeyframeMonitor *monitor = user_data;
+  gboolean keyframe = FALSE;
+  gboolean latched = FALSE;
+  guint misses;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    GstBuffer *buffer = gst_pad_probe_info_get_buffer (info);
+
+    keyframe = !GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+  } else if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+    gst_buffer_list_foreach (gst_pad_probe_info_get_buffer_list (info),
+        kms_keyframe_monitor_find_keyframe, &keyframe);
+  } else {
+    return GST_PAD_PROBE_OK;
+  }
+
+  g_mutex_lock (&monitor->mutex);
+  if (monitor->unresponsive || monitor->pending_since_us == 0) {
+    /* Nothing outstanding: a keyframe now is the sender's own doing */
+  } else if (keyframe) {
+    monitor->pending_since_us = 0;
+    monitor->misses = 0;
+  } else if (g_get_monotonic_time () - monitor->pending_since_us >=
+      KEYFRAME_RTCP_TIMEOUT_US) {
+    monitor->pending_since_us = 0;
+    monitor->misses++;
+    if (monitor->misses >= KEYFRAME_RTCP_MAX_MISSES) {
+      monitor->unresponsive = TRUE;
+      latched = TRUE;
+    }
+  }
+  misses = monitor->misses;
+  g_mutex_unlock (&monitor->mutex);
+
+  if (latched) {
+    GST_WARNING_OBJECT (monitor->endpoint, "Video SSRC %u ignored %u RTCP"
+        " keyframe requests in a row; no more RTCP requests to it, emitting"
+        " keyframe-needed instead", monitor->ssrc, misses);
+    kms_base_rtp_endpoint_emit_keyframe_needed (monitor->endpoint,
+        monitor->ssrc, KEYFRAME_REASON_RTCP_UNRESPONSIVE);
+  }
+
+  return GST_PAD_PROBE_OK;
+}
+
+static gboolean
+kms_base_rtp_endpoint_caps_have_rtcp_fb (const GstCaps *caps)
+{
+  const GstStructure *st;
+  gboolean pli = FALSE, fir = FALSE;
+
+  if (caps == NULL || gst_caps_get_size (caps) == 0) {
+    return FALSE;
+  }
+
+  st = gst_caps_get_structure (caps, 0);
+  gst_structure_get_boolean (st, "rtcp-fb-nack-pli", &pli);
+  gst_structure_get_boolean (st, "rtcp-fb-ccm-fir", &fir);
+
+  return pli || fir;
+}
+
+/* Installs the keyframe monitor on a video depayloader that is about to be
+ * linked. A no-op in RTCP mode, which leaves today's path untouched. */
+static void
+kms_base_rtp_endpoint_monitor_keyframes (KmsBaseRtpEndpoint *self,
+    KmsRecvBranch *branch, GstElement *depayloader)
+{
+  KmsKeyframeMode mode = g_atomic_int_get (&self->priv->keyframe_mode);
+  KmsKeyframeMonitor *monitor;
+  gboolean rtcp_fb;
+  GstPad *pad;
+
+  if (mode == KMS_KEYFRAME_MODE_RTCP) {
+    return;
+  }
+
+  rtcp_fb = kms_base_rtp_endpoint_caps_have_rtcp_fb (branch->caps);
+  monitor = kms_keyframe_monitor_new (self, branch->ssrc, mode, rtcp_fb);
+
+  GST_INFO_OBJECT (self, "Keyframe mode %s for video SSRC %u (rtcp-fb: %s)",
+      mode == KMS_KEYFRAME_MODE_BOTH ? "BOTH" : "SMART", branch->ssrc,
+      rtcp_fb ? "yes" : "no");
+
+  pad = gst_element_get_static_pad (depayloader, "sink");
+  if (pad != NULL) {
+    gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_UPSTREAM,
+        kms_keyframe_monitor_request_probe, kms_keyframe_monitor_ref (monitor),
+        kms_keyframe_monitor_unref);
+    gst_object_unref (pad);
+  }
+
+  /* Only SMART with rtcp-fb has RTCP answers to judge */
+  if (mode == KMS_KEYFRAME_MODE_SMART && rtcp_fb) {
+    pad = gst_element_get_static_pad (depayloader, "src");
+    if (pad != NULL) {
+      gst_pad_add_probe (pad,
+          GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST,
+          kms_keyframe_monitor_buffer_probe, kms_keyframe_monitor_ref (monitor),
+          kms_keyframe_monitor_unref);
+      gst_object_unref (pad);
+    }
+  }
+
+  kms_keyframe_monitor_unref (monitor);
+}
+
+/* Keyframe monitor end */
+
 /* Builds a branch's element from `caps` and puts it into the pipeline, making it
  * the branch that feeds its media's agnosticbin.
  *
@@ -2782,6 +3085,12 @@ kms_base_rtp_endpoint_attach_branch (KmsBaseRtpEndpoint *self,
       }
       gst_object_unref (sink_pad);
     }
+  }
+
+  /* Before data flows, so that the very first request is seen */
+  if (linked && type == KMS_RECV_BRANCH_DEPAYLOADER
+      && branch->session == VIDEO_RTP_SESSION) {
+    kms_base_rtp_endpoint_monitor_keyframes (self, branch, element);
   }
 
   if (linked) {
@@ -3698,6 +4007,9 @@ kms_base_rtp_endpoint_set_property (GObject *object,
     case PROP_OFFER_DIR:
       self->priv->offer_dir = g_value_get_enum (value);
       break;
+    case PROP_KEYFRAME_MODE:
+      g_atomic_int_set (&self->priv->keyframe_mode, g_value_get_int (value));
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       break;
@@ -3763,6 +4075,9 @@ kms_base_rtp_endpoint_get_property (GObject *object,
       break;
     case PROP_SUPPORT_FEC:
       g_value_set_boolean (value, self->priv->support_fec);
+      break;
+    case PROP_KEYFRAME_MODE:
+      g_value_set_int (value, g_atomic_int_get (&self->priv->keyframe_mode));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -3897,6 +4212,8 @@ kms_base_rtp_endpoint_finalize (GObject *gobject)
   if (self->priv->stats_file) {
     fclose (self->priv->stats_file);
   }
+
+  g_mutex_clear (&self->priv->keyframe_mutex);
 
   G_OBJECT_CLASS (kms_base_rtp_endpoint_parent_class)->finalize (gobject);
 }
@@ -4245,6 +4562,14 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass *klass)
           "Forward error correction supported", FALSE,
           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (object_class, PROP_KEYFRAME_MODE,
+      g_param_spec_int ("keyframe-mode", "Keyframe mode",
+          "How keyframes are requested from the remote video sender: "
+          "0 = RTCP only, 1 = SMART (emit keyframe-needed when RTCP cannot or "
+          "does not work), 2 = BOTH (RTCP and keyframe-needed every time)",
+          KMS_KEYFRAME_MODE_RTCP, KMS_KEYFRAME_MODE_BOTH, DEFAULT_KEYFRAME_MODE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /* set signals */
   obj_signals[GET_CONNECTION_STATE] = g_signal_new ("get-connection_state",
       G_TYPE_FROM_CLASS (klass), G_SIGNAL_ACTION | G_SIGNAL_RUN_LAST,
@@ -4290,6 +4615,13 @@ kms_base_rtp_endpoint_class_init (KmsBaseRtpEndpointClass *klass)
       G_TYPE_INT,               // volume
       G_TYPE_INT,               // duration
       G_TYPE_STRING);           // media_type
+
+  obj_signals[KEYFRAME_NEEDED] =
+      g_signal_new ("keyframe-needed", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST,
+      G_STRUCT_OFFSET (KmsBaseRtpEndpointClass, keyframe_needed), NULL, NULL,
+      g_cclosure_marshal_generic, G_TYPE_NONE, 2, G_TYPE_UINT,  /* ssrc */
+      G_TYPE_STRING);           /* reason */
 
   g_type_class_add_private (klass, sizeof (KmsBaseRtpEndpointPrivate));
 
@@ -4765,6 +5097,9 @@ kms_base_rtp_endpoint_init (KmsBaseRtpEndpoint *self)
   self->priv->mtu = DEFAULT_MTU;
 
   self->priv->offer_dir = DEFAULT_OFFER_DIR;
+
+  self->priv->keyframe_mode = DEFAULT_KEYFRAME_MODE;
+  g_mutex_init (&self->priv->keyframe_mutex);
 }
 
 GObject *
