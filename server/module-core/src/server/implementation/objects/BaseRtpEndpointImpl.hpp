@@ -74,6 +74,7 @@ public:
   sigc::signal<void, MediaStateChanged> signalMediaStateChanged;
   sigc::signal<void, ConnectionStateChanged> signalConnectionStateChanged;
   sigc::signal<void, DtmfEventDetected> signalDtmfEventDetected;
+  sigc::signal<void, KeyframeNeeded> signalKeyframeNeeded;
 
   /* Next methods are automatically implemented by code generator */
   using SdpEndpointImpl::connect;
@@ -101,6 +102,7 @@ private:
   gulong connStateChangedHandlerId;
   std::recursive_mutex mutex;
   gulong dtmfEventDetectedHandlerId;
+  gulong keyframeNeededHandlerId;
 
   void updateMediaState (guint new_state);
   void updateConnectionState (gchar *sessId, guint new_state);
@@ -109,6 +111,7 @@ private:
                             gint volume,
                             gint duration,
                             const gchar *mediaType);
+  void onKeyframeNeeded (guint ssrc, const gchar *reason);
 
   void collectEndpointStats (
     std::map<std::string, std::shared_ptr<Stats>> &statsReport,

@@ -1053,7 +1053,8 @@ Pipeline, towards the associated producer. Only valid for video consumers.
       "events": [
         "MediaStateChanged",
         "ConnectionStateChanged",
-        "DtmfEventDetected"
+        "DtmfEventDetected",
+        "KeyframeNeeded"
       ]
     },
     {
@@ -1644,6 +1645,16 @@ Pipeline, towards the associated producer. Only valid for video consumers.
       ],
       "name": "MediaType",
       "doc": "Type of media stream to be exchanged.\nCan take the values AUDIO, DATA or VIDEO."
+    },
+    {
+      "typeFormat": "ENUM",
+      "values": [
+        "RTCP",
+        "SMART",
+        "BOTH"
+      ],
+      "name": "KeyFrameMode",
+      "doc": "How an RTP endpoint obtains keyframes from the remote video sender.\n<ul>\n  <li>RTCP: RTCP PLI/FIR only (default, previous behaviour).</li>\n  <li>SMART: RTCP while it works; fire KeyframeNeeded instead when no PLI/FIR was negotiated, or once the sender has ignored RTCP keyframe requests (after which none are sent to it).</li>\n  <li>BOTH: RTCP and KeyframeNeeded for every keyframe request.</li>\n</ul>"
     },
     {
       "typeFormat": "ENUM",
@@ -2747,6 +2758,28 @@ and is ready for establishing a connection.
         {
           "name": "mediaType",
           "doc": "Media type where DTMF was detected (typically 'audio')",
+          "type": "String"
+        }
+      ]
+    },
+    {
+      "name": "KeyframeNeeded",
+      "extends": "Media",
+      "doc": "Fired when the endpoint needs a keyframe from the remote video sender and RTCP cannot, or does not, get one: packet loss, or a keyframe request from a consumer downstream. The application should ask the sender through its own signalling, e.g. SIP INFO picture_fast_update. Only fired when the RtpEndpoint was created with keyFrameMode SMART or BOTH; throttled to at most one per second per endpoint.",
+      "properties": [
+        {
+          "name": "ssrc",
+          "doc": "SSRC of the remote video stream that needs a keyframe",
+          "type": "int64"
+        },
+        {
+          "name": "mediaType",
+          "doc": "Media type of that stream (always VIDEO)",
+          "type": "MediaType"
+        },
+        {
+          "name": "reason",
+          "doc": "Why RTCP is not enough: NO_RTCP_FB (no PLI/FIR negotiated), RTCP_UNRESPONSIVE (the sender ignored RTCP keyframe requests; no more are sent to it) or BOTH (keyFrameMode BOTH: every request is reported)",
           "type": "String"
         }
       ]

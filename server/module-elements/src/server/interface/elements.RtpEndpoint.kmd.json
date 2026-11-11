@@ -97,6 +97,13 @@ RTP or SRTP protocols.
               "type": "boolean",
               "optional": true,
               "defaultValue": false
+            },
+            {
+              "name": "keyFrameMode",
+              "doc": "How keyframes are obtained from the remote video sender. RTCP (default): RTCP PLI/FIR only. SMART: RTCP while it works, and fire :rom:evt:`KeyframeNeeded` when no PLI/FIR was negotiated or the sender ignores them (RTCP requests then stop for that sender). BOTH: RTCP and :rom:evt:`KeyframeNeeded` for every keyframe request.",
+              "type": "KeyFrameMode",
+              "optional": true,
+              "defaultValue": "RTCP"
             }
           ]
         },

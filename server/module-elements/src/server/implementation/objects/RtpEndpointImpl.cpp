@@ -45,11 +45,18 @@ namespace kurento
 
 RtpEndpointImpl::RtpEndpointImpl (const boost::property_tree::ptree &conf,
                                   std::shared_ptr<MediaPipeline> mediaPipeline,
-                                  std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf)
+                                  std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf,
+                                  std::shared_ptr<KeyFrameMode> keyFrameMode)
   : BaseRtpEndpointImpl (conf,
                          std::dynamic_pointer_cast<MediaObjectImpl> (mediaPipeline),
                          FACTORY_NAME, useIpv6, listenDtmf)
 {
+  /* Same order as KmsKeyframeMode in kmsbasertpendpoint.c: RTCP, SMART, BOTH */
+  if (keyFrameMode) {
+    g_object_set (element, "keyframe-mode",
+                  static_cast<gint> (keyFrameMode->getValue () ), NULL);
+  }
+
   if (!crypto->isSetCrypto() ) {
     return;
   }
@@ -165,9 +172,11 @@ RtpEndpointImpl::onKeySoftLimit (gchar *media)
 MediaObjectImpl *
 RtpEndpointImplFactory::createObject (const boost::property_tree::ptree &conf,
                                       std::shared_ptr<MediaPipeline> mediaPipeline,
-                                      std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf) const
+                                      std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf,
+                                      std::shared_ptr<KeyFrameMode> keyFrameMode) const
 {
-  return new RtpEndpointImpl (conf, mediaPipeline, crypto, useIpv6, listenDtmf);
+  return new RtpEndpointImpl (conf, mediaPipeline, crypto, useIpv6, listenDtmf,
+                              keyFrameMode);
 }
 
 RtpEndpointImpl::StaticConstructor RtpEndpointImpl::staticConstructor;

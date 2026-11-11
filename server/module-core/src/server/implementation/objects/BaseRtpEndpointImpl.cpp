@@ -86,6 +86,13 @@ BaseRtpEndpointImpl::postConstructor ()
                                        this, std::placeholders::_2, std::placeholders::_3,
                                        std::placeholders::_4, std::placeholders::_5, std::placeholders::_6) ),
                                std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this () ) );
+
+  keyframeNeededHandlerId = register_signal_handler (G_OBJECT (element),
+                            "keyframe-needed",
+                            std::function<void (GstElement *, guint, const gchar *) > (std::bind (
+                                  &BaseRtpEndpointImpl::onKeyframeNeeded, this, std::placeholders::_2,
+                                  std::placeholders::_3) ),
+                            std::dynamic_pointer_cast<BaseRtpEndpointImpl> (shared_from_this () ) );
 }
 
 BaseRtpEndpointImpl::BaseRtpEndpointImpl (
@@ -105,6 +112,7 @@ BaseRtpEndpointImpl::BaseRtpEndpointImpl (
   connStateChangedHandlerId = 0;
 
   dtmfEventDetectedHandlerId = 0;
+  keyframeNeededHandlerId = 0;
 
   guint minPort = 0;
 
@@ -140,6 +148,10 @@ BaseRtpEndpointImpl::~BaseRtpEndpointImpl ()
 
   if (dtmfEventDetectedHandlerId > 0) {
     unregister_signal_handler (element, dtmfEventDetectedHandlerId);
+  }
+
+  if (keyframeNeededHandlerId > 0) {
+    unregister_signal_handler (element, keyframeNeededHandlerId);
   }
 }
 
@@ -255,6 +267,23 @@ BaseRtpEndpointImpl::onDtmfEventDetected (gint number,
   }
 
   // You might also want to emit a signal to JS or invoke internal handlers
+}
+
+void
+BaseRtpEndpointImpl::onKeyframeNeeded (guint ssrc, const gchar *reason)
+{
+  try {
+    std::shared_ptr<MediaType> mediaType =
+      std::make_shared<MediaType> (MediaType::VIDEO);
+    KeyframeNeeded event (shared_from_this (), KeyframeNeeded::getName (),
+                          static_cast<int64_t> (ssrc), mediaType,
+                          reason != nullptr ? reason : "");
+    sigcSignalEmit (signalKeyframeNeeded, event);
+  } catch (const std::bad_weak_ptr &e) {
+    // shared_from_this()
+    GST_ERROR ("BUG creating %s: %s", KeyframeNeeded::getName ().c_str (),
+               e.what () );
+  }
 }
 
 int

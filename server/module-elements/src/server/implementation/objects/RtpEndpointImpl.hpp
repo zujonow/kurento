@@ -19,6 +19,7 @@
 
 #include "BaseRtpEndpointImpl.hpp"
 #include "RtpEndpoint.hpp"
+#include "KeyFrameMode.hpp"
 #include <EventHandler.hpp>
 
 namespace kurento
@@ -37,7 +38,8 @@ public:
 
   RtpEndpointImpl (const boost::property_tree::ptree &conf,
                    std::shared_ptr<MediaPipeline> mediaPipeline,
-                   std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf);
+                   std::shared_ptr<SDES> crypto, bool useIpv6, bool listenDtmf,
+                   std::shared_ptr<KeyFrameMode> keyFrameMode);
 
   virtual ~RtpEndpointImpl ();
 
