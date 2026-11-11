@@ -85,7 +85,9 @@ typedef struct _KmsComedia KmsComedia;
 struct _KmsComedia
 {
   GHashTable *rtp_conns;        // GHashTable<RTPSession*, KmsIRtpConnection*>
-  GHashTable *signal_ids;       // GHashTable<RTPSession*, int>
+  GHashTable *signal_ids;       // GHashTable<RTPSession*, int> on-ssrc-active
+  GHashTable *validated_ids;    // GHashTable<RTPSession*, int> on-ssrc-validated
+  GHashTable *rtcp_hint;        // GHashTable<RTPSession*, gint>, see below
 };
 
 struct _KmsRtpEndpointPrivate
@@ -785,8 +787,43 @@ kms_rtp_endpoint_configure_media (KmsBaseSdpEndpoint *base_sdp_endpoint,
 
 /* Configure media SDP end */
 
+#define COMEDIA_RTCP_SAME_AS_RTP 0
+#define COMEDIA_RTCP_RTP_PLUS_ONE -1
+
 static void
-kms_rtp_endpoint_comedia_on_ssrc_active (GObject *rtpsession,
+kms_rtp_endpoint_comedia_disconnect (KmsRtpEndpoint *self, GObject *rtpsession)
+{
+  gulong id;
+
+  id = GPOINTER_TO_UINT (g_hash_table_lookup (self->priv->comedia.signal_ids,
+          rtpsession));
+  if (id != 0) {
+    g_signal_handler_disconnect (rtpsession, id);
+  }
+  g_hash_table_remove (self->priv->comedia.signal_ids, rtpsession);
+
+  id = GPOINTER_TO_UINT (g_hash_table_lookup (self->priv->comedia.validated_ids,
+          rtpsession));
+  if (id != 0) {
+    g_signal_handler_disconnect (rtpsession, id);
+  }
+  g_hash_table_remove (self->priv->comedia.validated_ids, rtpsession);
+}
+
+/*
+ * Learn the remote RTP/RTCP destination from the packets the remote sends.
+ *
+ * Called on "on-ssrc-validated" (first valid RTP from a source) and on
+ * "on-ssrc-active" (RTCP from a source). Only the RTP source address is
+ * required: a peer behind a NAT that changes ports, or one that multiplexes
+ * RTCP on its RTP port (rtcp-mux), never sends anything to our RTCP port, so
+ * waiting for 'rtcp-from' would mean never sending media at all. When
+ * 'rtcp-from' is not known, the RTCP port comes from the "rtcp hint" taken
+ * from the remote SDP: COMEDIA_RTCP_SAME_AS_RTP (a=rtcp-mux), a port from
+ * a=rtcp, or COMEDIA_RTCP_RTP_PLUS_ONE.
+ */
+static void
+kms_rtp_endpoint_comedia_on_ssrc (GObject *rtpsession,
     GObject *rtpsource, KmsRtpEndpoint *self)
 {
   GstStructure *source_stats = NULL;
@@ -794,28 +831,26 @@ kms_rtp_endpoint_comedia_on_ssrc_active (GObject *rtpsession,
   gchar *rtcp_from = NULL;
   GNetworkAddress *rtp_addr = NULL;
   GNetworkAddress *rtcp_addr = NULL;
-  gboolean ok;
+  guint rtp_port, rtcp_port;
+  gint rtcp_hint;
 
   guint ssrc;
   gboolean is_validated;
-  gboolean is_sender;
 
-  // Each session has a minimum of 2 source SSRCs: sender and receiver.
-  // Here we look for stats from the sender which had COMEDIA enabled
-  // (by setting "a=direction:active" in the SDP negotiation).
+  g_object_get (rtpsource, "ssrc", &ssrc, "is-validated", &is_validated, NULL);
 
-  // Property RTPSource::ssrc, doc: GStreamer/rtpsource.c
-  g_object_get (rtpsource,
-      "ssrc", &ssrc, "is-validated", &is_validated, "is-sender", &is_sender,
-      NULL);
-
-  if (!is_validated || !is_sender) {
+  if (!is_validated) {
     GST_DEBUG_OBJECT (rtpsession,
         "Ignore uninteresting RTPSource, SSRC: %u", ssrc);
     return;
   }
 
-  GST_INFO_OBJECT (rtpsession, "COMEDIA: Get port info, SSRC: %u", ssrc);
+  KmsRtpBaseConnection *conn =
+      g_hash_table_lookup (self->priv->comedia.rtp_conns, rtpsession);
+  if (conn == NULL) {
+    // Already latched (or never set up).
+    return;
+  }
 
   g_object_get (rtpsource, "stats", &source_stats, NULL);
   if (!source_stats) {
@@ -823,72 +858,64 @@ kms_rtp_endpoint_comedia_on_ssrc_active (GObject *rtpsession,
     return;
   }
 
-  ok = gst_structure_get (source_stats,
-      "rtp-from", G_TYPE_STRING, &rtp_from, NULL);
-  if (!ok) {
-    GST_WARNING_OBJECT (rtpsession, "COMEDIA: 'rtp-from' not available yet");
+  // Only remote sources that sent RTP have 'rtp-from'; our own internal
+  // sender source never does.
+  if (!gst_structure_get (source_stats,
+          "rtp-from", G_TYPE_STRING, &rtp_from, NULL)) {
+    GST_DEBUG_OBJECT (rtpsession,
+        "COMEDIA: 'rtp-from' not available yet, SSRC: %u", ssrc);
     goto end;
-  } else {
-    GST_INFO_OBJECT (rtpsession, "COMEDIA: 'rtp-from' found: '%s'", rtp_from);
-  }
-
-  ok = gst_structure_get (source_stats,
-      "rtcp-from", G_TYPE_STRING, &rtcp_from, NULL);
-  if (!ok) {
-    GST_WARNING_OBJECT (rtpsession, "COMEDIA: 'rtcp-from' not available yet");
-    goto end;
-  } else {
-    GST_INFO_OBJECT (rtpsession, "COMEDIA: 'rtcp-from' found: '%s'", rtcp_from);
   }
 
   rtp_addr = G_NETWORK_ADDRESS (g_network_address_parse (rtp_from, 5004, NULL));
   if (!rtp_addr) {
-    GST_ERROR_OBJECT (rtpsession, "COMEDIA: Cannot parse 'rtp-from'");
+    GST_ERROR_OBJECT (rtpsession, "COMEDIA: Cannot parse 'rtp-from': '%s'",
+        rtp_from);
     goto end;
   }
+  rtp_port = g_network_address_get_port (rtp_addr);
 
-  rtcp_addr =
-      G_NETWORK_ADDRESS (g_network_address_parse (rtcp_from, 5005, NULL));
-  if (!rtcp_addr) {
-    GST_ERROR_OBJECT (rtpsession, "COMEDIA: Cannot parse 'rtcp-from'");
-    goto end;
-  }
-
-  KmsRtpBaseConnection *conn =
-      g_hash_table_lookup (self->priv->comedia.rtp_conns, rtpsession);
-
-  kms_rtp_base_connection_set_remote_info (conn,
-      g_network_address_get_hostname (rtcp_addr),
-      g_network_address_get_port (rtp_addr),
-      g_network_address_get_port (rtcp_addr));
-
-  GST_INFO_OBJECT (rtpsession,
-      "COMEDIA: Parsed route: IP: %s, RTP: %u, RTCP: %u",
-      g_network_address_get_hostname (rtcp_addr),
-      g_network_address_get_port (rtp_addr),
-      g_network_address_get_port (rtcp_addr));
-
-  gulong signal_id =
-      GPOINTER_TO_UINT (g_hash_table_lookup (self->priv->comedia.signal_ids,
+  rtcp_hint = GPOINTER_TO_INT (g_hash_table_lookup (self->priv->comedia.rtcp_hint,
           rtpsession));
 
+  if (gst_structure_get (source_stats,
+          "rtcp-from", G_TYPE_STRING, &rtcp_from, NULL)) {
+    rtcp_addr =
+        G_NETWORK_ADDRESS (g_network_address_parse (rtcp_from, 5005, NULL));
+  }
+
+  if (rtcp_addr) {
+    rtcp_port = g_network_address_get_port (rtcp_addr);
+  } else {
+    if (rtcp_hint == COMEDIA_RTCP_SAME_AS_RTP) {
+      rtcp_port = rtp_port;
+    } else if (rtcp_hint == COMEDIA_RTCP_RTP_PLUS_ONE) {
+      rtcp_port = rtp_port + 1;
+    } else {
+      rtcp_port = (guint) rtcp_hint;
+    }
+  }
+
   GST_INFO_OBJECT (rtpsession,
-      "COMEDIA: Disconnect from signal 'on_ssrc_active'");
-  g_signal_handler_disconnect (rtpsession, signal_id);
+      "COMEDIA: SSRC %u, rtp-from '%s', rtcp-from '%s'%s; route IP: %s,"
+      " RTP: %u, RTCP: %u", ssrc, rtp_from, rtcp_from ? rtcp_from : "(none)",
+      rtcp_addr ? "" : (rtcp_hint == COMEDIA_RTCP_SAME_AS_RTP ? " (rtcp-mux)"
+          : rtcp_hint == COMEDIA_RTCP_RTP_PLUS_ONE ? " (assume RTP + 1)"
+          : " (a=rtcp)"),
+      g_network_address_get_hostname (rtp_addr), rtp_port, rtcp_port);
+
+  kms_rtp_base_connection_set_remote_info (conn,
+      g_network_address_get_hostname (rtp_addr), rtp_port, rtcp_port);
+
+  // Latch once: multiudpsink "add" would otherwise add a second destination.
+  kms_rtp_endpoint_comedia_disconnect (self, rtpsession);
+  g_hash_table_remove (self->priv->comedia.rtp_conns, rtpsession);
 
 end:
-  if (rtp_addr) {
-    g_object_unref (rtp_addr);
-  }
-  if (rtcp_addr) {
-    g_object_unref (rtcp_addr);
-  }
-  if (rtp_from) {
-    g_free (rtp_from);
-  }
-  if (rtcp_from) {
-    g_free (rtcp_from);
-  }
+  g_clear_object (&rtp_addr);
+  g_clear_object (&rtcp_addr);
+  g_free (rtp_from);
+  g_free (rtcp_from);
   gst_structure_free (source_stats);
 }
 
@@ -918,13 +945,37 @@ kms_rtp_endpoint_comedia_manager_create (KmsRtpEndpoint *self,
     return;
   }
 
+  gboolean rtcp_mux = gst_sdp_media_get_attribute_val (media, "rtcp-mux")
+      != NULL;
+  const gchar *attr_rtcp = gst_sdp_media_get_attribute_val (media, "rtcp");
+  gint rtcp_hint = COMEDIA_RTCP_RTP_PLUS_ONE;
+
+  if (rtcp_mux) {
+    rtcp_hint = COMEDIA_RTCP_SAME_AS_RTP;
+  } else if (attr_rtcp != NULL) {
+    guint64 port = g_ascii_strtoull (attr_rtcp, NULL, 10);
+
+    if (port > 0 && port <= G_MAXUINT16) {
+      rtcp_hint = (gint) port;
+    }
+  }
+
   gulong signal_id = g_signal_connect (rtpsession, "on-ssrc-active",
-      G_CALLBACK (kms_rtp_endpoint_comedia_on_ssrc_active), self);
+      G_CALLBACK (kms_rtp_endpoint_comedia_on_ssrc), self);
+  gulong validated_id = g_signal_connect (rtpsession, "on-ssrc-validated",
+      G_CALLBACK (kms_rtp_endpoint_comedia_on_ssrc), self);
 
   g_hash_table_insert (self->priv->comedia.rtp_conns, g_object_ref (rtpsession),
       conn);
   g_hash_table_insert (self->priv->comedia.signal_ids,
       g_object_ref (rtpsession), GUINT_TO_POINTER (signal_id));
+  g_hash_table_insert (self->priv->comedia.validated_ids,
+      g_object_ref (rtpsession), GUINT_TO_POINTER (validated_id));
+  g_hash_table_insert (self->priv->comedia.rtcp_hint,
+      g_object_ref (rtpsession), GINT_TO_POINTER (rtcp_hint));
+
+  GST_INFO_OBJECT (self, "COMEDIA: Media '%s' waits for remote RTP%s",
+      media_str, rtcp_mux ? " (remote offered rtcp-mux)" : "");
 
   g_object_unref (rtpsession);
 }
@@ -1110,6 +1161,8 @@ kms_rtp_endpoint_finalize (GObject *object)
 
   g_hash_table_unref (self->priv->comedia.rtp_conns);
   g_hash_table_unref (self->priv->comedia.signal_ids);
+  g_hash_table_unref (self->priv->comedia.validated_ids);
+  g_hash_table_unref (self->priv->comedia.rtcp_hint);
 
   /* chain up */
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -1190,6 +1243,10 @@ kms_rtp_endpoint_init (KmsRtpEndpoint *self)
   self->priv->comedia.rtp_conns = g_hash_table_new_full (NULL, NULL,
       g_object_unref, NULL);
   self->priv->comedia.signal_ids = g_hash_table_new_full (NULL, NULL,
+      g_object_unref, NULL);
+  self->priv->comedia.validated_ids = g_hash_table_new_full (NULL, NULL,
+      g_object_unref, NULL);
+  self->priv->comedia.rtcp_hint = g_hash_table_new_full (NULL, NULL,
       g_object_unref, NULL);
 
   g_object_set (G_OBJECT (self), "bundle",
